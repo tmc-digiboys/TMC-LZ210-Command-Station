@@ -2,6 +2,8 @@
 
 The TMC-LZ210 is a DCC Command Station. It supports the following functions: the DCC protocol via the normal DCC output, the DCC protocol via a CDE booster output, and the DCC protocol via a LocoNet booster. Furthermore, it supports various communication interfaces, i.e. XpressNet over LAN/USB, XpressNet via RS-485, and the Z21 protocol via a UDP LAN interface. A web server provides the possibility to configure several command-station-specific configuration parameters. For feedback support, an RS-Bus interface is present for handling a maximum of 128 feedback decoders.
 
+## Software Architecture
+
 The architecture of the TMC-LZ210 command station is built around the dual-core functionality of the RP2350 Pico 2 microcontroller. 
 
 [![Screenshot](images/Architecture_LZ210.png)](images/Architecture_LZ210.png)
@@ -95,4 +97,126 @@ Three high-level main modules can be identified:
     The DCC Current handler is reponsible for the detection of an shortcircuit on the DCC interface and for the detection of an ACk pulse during programming a decoder. Currently this is deactivated due to hardware issues.
 
 
+## Development Environment
 
+The development environment used to write the LZ210 Software is the Arduino IDE 2.3.10. The connection to the hardware can be a simple USB connection to the RP-2350 microprocessor, and image transfer kan be done via UF2 format. In this situation the boot button on the RP-2350 should be pressed when connecting the USB cable. Then the PC wil see the RP-2350 as a external storage device and the UF2 formatted image can be uploaded to the processor. Another means to upload the image is to use a Raspberry PI Debug Probe, then the upload method used should be set to Picoprobe/Debugprobe ( CMSIS - DAP) in the ide tool menu.
+
+The board package that has to be selected is the Raspberry PI Pico/RP2040/RP2350 by Earl Philhower, III and in the tools menu of the ide the board type must be set to Raspberry PI Pico 2.
+
+Another setting which has to be made in the Arduino IDE in the tools menu is the flash size 4MB (Sketch: 3968 KB / FS 128KB). This because the eeprom simulation is implemented as a tiny filesystem.
+
+### Libraries
+
+The LZ210 software depends on several available Libraries, inorder to build the image the following libraries should be available:
+
+- **The standard Ethernet Library**
+
+  The standard Etnernet library is available in the installed library package, so it doesn't have to be installed seperately.
+
+- **The Bonjour Library**
+
+  The LZ210 supports mDNS functionality which is implemented via the Bonjour library, therefore this library needs to be installed.
+
+- **The RS-Bus Master library**
+  
+  This library is provided in the repositories of the github of Aiko Pras. It handles the communication with the RS-Bus feedback decoders.
+
+- **The Loconet2-master-TMC library**
+
+  This library can be found in the repositories on the github page of TMC-Digiboys. The Loconet2-TMC library implements the basic communication with the Loconet interface. This library is used by the Lcocnet module of the LZ210. At this moment only the FREMO FREDS are supported.
+
+- **The DCCInterfaceMaster-TMC library**
+
+    This library implements the DCC interface of the LZ210. This library should be configured to use de RP 2040 in the variants- Z21PG. 
+
+- **The Embedded Template Library ( ETL ) by John Wellbelove**
+
+  This library provides for templates which are used in the loconet2-TMC-master library.
+
+
+### Main Ino file
+
+The main ino file for the LZ210 is provided in the repsoitory. This file defines the compleet functionality of the LZ210. 
+This file is neede for the LZ210 software. Some configuration can be done in this ino file to configure the configuration of the LZ210.
+
+### RP2350 Hardware functions
+
+The Raspberry PI RP-2350 supports several hardware functions below is a description which hardware function is used for a LZ210 functionality. Pin Assignement for the hardware function can be found in the hardware_config.h file.
+
+- In the LZ210 three Serial ports are used:
+  - Serial:   For the onboard usb interface.
+  - Serial1:  Used for the Loconet Interface.
+  - Serial2:  Used as debug port special header is provided on the PCB
+
+- The RP2350 has three seperate PIO available all these PIOs are currently in use in the LZ210:
+
+  - PIO 0 is in use in the DCCInterface Master-TMC library to realize a correct stable DCC signal. for more info see the description of the library.
+  - PIO 1 is in use in the RS-Bus master library to implement the rsbus interface for communication to the RS-Bus decoders. More information can be found in the
+  library.
+  - PIO 2 is in use in the Xpressnet RS485 module to implement a 9-bits Uart for the communication with the slave devices.
+
+- One of the onboard ADC channel is used for the detection of a shortcircuit on the DCC signal and for the etection of een DCC Ack pulse as a reposne of a programming action. However due to hardware related issues this is currently disbaled and not working.
+
+### Software Versions
+
+There will be at least two versions, Version-1 and version-2. Version-1 is developed for the first LZ210 hardware, which is only used for internal testing purposes. Version-2 will be made available when the version-2 hardware becomes available, Some modifications need to be made to provide for full functionality of the version-2 hardware. Currently software version 1 is stored in the repository. This software can not be used on the TMC-LZ210 Hardware described in the TMC-LZ210-Command-station-PCB repository without modification. As soon as the hardware is available the software will be modified according the new hardware and tested. Only Then the version-2 software will be made available.
+
+Further development will only be done on version-2 software, and intime bug fix releases will be available.
+
+## Software Configuration
+
+There are two configuration options available.
+
+- Compile time configuration;
+- Runtime configuration;
+
+### Compile time configuration.
+
+The LZ210 software is build around modules. These modules are dynamical enabled in the code ( LZ210.ino file) as shown below:
+
+```CPP
+ // ── Register modules ───────────────
+    bool r0 = registry().add(&gOled);
+    bool r1 = registry().add(&EepromStore::instance());
+    
+    bool r2  = registry().add(&gDccHal);
+    bool r2b = registry().add(&gRsBusHal);
+    
+    bool r3 = registry().add(&gLenzLan);
+    bool r4 = registry().add(&gLenzUsb);
+    bool r5 = registry().add(&gZ21Lan);
+    bool r6 = registry().add(&gXpressNetRs485);
+    bool r7 = registry().add(&gWebserver);
+    bool r8 = registry().add(&gLocoNet);
+```
+    
+The LZ210 will during its Start-up phase register the selected functions. By removing a function it will not be enabled during start-up. Keep in mind that the code is still available compile-time but it will not be executed.
+
+### Runtime configuration
+
+The LZ210 provides a webserver where several configuration parameters kan be changed. 
+
+[![Screenshot](images/webpagina.png)](images/webpagina.png)
+
+The figure above provides an example of the webpage. In the figure kan be seen that several entries are foreseen:
+
+- **system**
+  - Factory reset
+  - System parameters
+  - Internet
+  - LenzLan
+  - Z21
+  - Web interface
+
+- **Configuration**
+  - DCC-HAL
+  - RSbus-HAL
+  - Xpressnet
+
+- **Tables**
+  - Locomotives
+  - Turnouts
+  - Feedback
+
+The Last entry, the tables, provide information about the locomitves, Turnouts, and the feedback decoders. No Configuration is possible.
+See the website itself for detailed configuration parameters.
