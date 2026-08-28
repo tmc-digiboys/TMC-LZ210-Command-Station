@@ -123,9 +123,13 @@ struct CentraleState {
     uint8_t  sv[256]         = {};     // System variables (SV read/write via 0x63)
     uint8_t  mtDow = 0, mtHour = 0, mtMinute = 0, mtFactor = 0;  // Model time
     bool     mtRunning = false;        // True if model clock is running
-    uint16_t buildNr = 0;             // Station firmware build number
-    uint8_t  rmVersion = 0, bootloaderVer = 0;  // Firmware version bytes
-    uint16_t rmBuildNr = 0;           // Feedback module build number
+    uint16_t buildNr = 0;             // Station firmware build number.
+                                       // Set from LZ210_FW_VERSION_MAJOR/
+                                       // MINOR (version.h) in LZ210.ino's
+                                       // setup() — was previously declared
+                                       // but never actually populated.
+    uint8_t  rmVersion = 0, bootloaderVer = 0;  // Firmware version bytes (feedback modules — not yet populated)
+    uint16_t rmBuildNr = 0;           // Feedback module build number (not yet populated)
 };
 
 // ─────────────────────────────────────────────────────────────

@@ -30,6 +30,7 @@
 //#define FACTORY_RESET
 
 #include "src/module_arch.h"
+#include "src/version.h"
 #include "src/hardware_config.h"
 #include "src/module_registry.h"
 #include "src/loconet_module.h"
@@ -145,7 +146,8 @@ volatile bool gSerial2Ready = false;
 void setup() {
     Serial2.begin(115200);
     gSerial2Ready = true;
-    traceSerial.println("LZ210 v1.0 boot");
+    traceSerial.printf("LZ210 v%s boot (hw rev %d)\n",
+                        LZ210_FW_VERSION_STR, LZ210_HW_REVISION);
 // GPIO pins  available on extended connector used for debux
 pinMode(HW_EXT_GPIO_4, OUTPUT);
 pinMode(HW_EXT_GPIO_5, OUTPUT);
@@ -234,6 +236,13 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
 
     gCentrale.trackPowerOff = true;   // start with track power off
     gCentrale.emergencyStop = false;
+    // Station firmware version, reported via XpressNet's Extended
+    // Software Version response (0x21/0x23 -> handleExtraVersion()'s
+    // "ZBldH"/"ZBldL" bytes). Previously always 0 — gCentrale.buildNr
+    // existed as a field but was never actually populated anywhere.
+    // Packed as (MAJOR<<8)|MINOR so the two transmitted bytes read
+    // directly as major/minor (e.g. v1.0 -> ZBldH=0x01, ZBldL=0x00).
+    gCentrale.buildNr = ((uint16_t)LZ210_FW_VERSION_MAJOR << 8) | LZ210_FW_VERSION_MINOR;
     // Interface device address (XpressNet SV1) — see the
     // "xn.li_address" registration further down (in setup1()) for the
     // full explanation. get() works standalone with its own fallback
@@ -477,6 +486,12 @@ void _registerDefaultParams() {
         nullptr
     };
     store.registerEnum("sys.cde_mode", 0, 0, kCdeModeOpts);
+    // Whether a CDE booster is actually connected — see
+    // _checkCdeShort()'s own comment in dcc_hal.cpp for why this
+    // exists: with no booster wired up, the E-signal floats/reads
+    // permanently low, which would otherwise trip a false, never-
+    // clearing short-circuit detection continuously.
+    store.registerBool("sys.cde_enable", true, ModuleId::DCC_HAL);
     // Turnout output-bit inversion — wiring-dependent, per RCN-213/Z21
     // spec (neither dictates a straight/thrown meaning for the R-bit).
     // Default true matches the historically-tuned behaviour for Rob's
@@ -516,6 +531,11 @@ void _registerDefaultParams() {
     store.registerBool  ("net.dhcp",     true,                     0);
     store.registerUint16("lenz.port",    5550,  ModuleId::LENZ_LAN);
     store.registerUint8 ("lenz.maxconn", 8,     ModuleId::LENZ_LAN);
+    // Client inactivity timeout (seconds) — see LENZ_LAN_TIMEOUT_DEFAULT_MS
+    // in lenz_lan.h for why this became configurable (Rob: Rocrail
+    // repeatedly disconnecting while idle, needing a longer margin
+    // than the previous fixed 30s).
+    store.registerUint16("xn.lan_timeout_s", 60, ModuleId::LENZ_LAN);
     store.registerUint16("z21.port",     21105, ModuleId::Z21_LAN);
     // Client inactivity timeout (seconds) — see Z21_CLIENT_TIMEOUT_DEFAULT_MS
     // in z21_lan.h for why 60s specifically (the official Z21 LAN

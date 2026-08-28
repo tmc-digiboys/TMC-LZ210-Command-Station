@@ -1,4 +1,5 @@
 #include "webserver.h"
+#include "version.h"
 #include "xpressnet_handler.h"   // gAccessories, MAX_ACCESSORIES, gCentrale
 #include "dcc_hal.h"              // gDccHal
 #include "power_monitor.h"        // gPowerMonitor
@@ -485,8 +486,14 @@ const __FlashStringHelper* Webserver::_cmdTypeName(CmdType t) {
 
 void Webserver::_panelSysteem(EthernetClient& c) {
     _shellOpen(c, "systeem", "System");
-    c.print(F("<h2>System</h2>"
-              "<form method='POST' action='/config'>"
+    c.print(F("<h2>System</h2>"));
+    c.print(F("<fieldset><legend>System Info</legend><table>"
+              "<tr><td>Software version</td><td>LZ210 v"));
+    c.print(LZ210_FW_VERSION_STR);
+    c.print(F("</td></tr><tr><td>Hardware revision</td><td>v"));
+    c.print(LZ210_HW_REVISION);
+    c.print(F("</td></tr></table></fieldset>"));
+    c.print(F("<form method='POST' action='/config'>"
               "<input type='hidden' name='_p' value='systeem'>"));
     c.print(F("<fieldset><legend>Turnout wiring</legend>"
               "<p class='hint'>Whether a straight/thrown command results in a "
@@ -499,7 +506,11 @@ void Webserver::_panelSysteem(EthernetClient& c) {
     c.print(F("<fieldset><legend>CDE Booster short-circuit response</legend>"
               "<p class='hint'>Sets how the LZ210 responds when a CDE booster"
               " detects a short circuit (E-signal held continuously low longer"
-              " than the threshold below).</p>"));
+              " than the threshold below). If no CDE booster is connected at "
+              "all, turn detection off entirely below — otherwise the "
+              "floating/undefined E-signal will read as a permanent, "
+              "never-clearing short circuit.</p>"));
+    _printField(c, "sys.cde_enable", "CDE booster connected (detection enabled)");
     _printField(c, "sys.cde_mode", "Response to short circuit");
     _printField(c, "sys.cde_short_mv", "Short-circuit voltage threshold (mV)");
     _printField(c, "sys.cde_short_us", "Short-circuit duration threshold (&micro;s)");
@@ -578,6 +589,14 @@ void Webserver::_panelLenzLan(EthernetClient& c) {
     c.print(F("<fieldset><legend>TCP Server</legend>"));
     _printField(c, "lenz.port",    "TCP port");
     _printField(c, "lenz.maxconn", "Max connections");
+    c.print(F("</fieldset><fieldset><legend>Client Tracking</legend>"
+              "<p class='hint'>How long a client may stay idle before "
+              "the connection is dropped. Increase this if a client "
+              "(e.g. Rocrail) disconnects/reconnects repeatedly while "
+              "the layout is genuinely idle (track power on, nothing "
+              "moving) — its own lifecheck interval may be longer than "
+              "the current setting.</p>"));
+    _printField(c, "xn.lan_timeout_s", "Client inactivity timeout (seconds)");
     c.print(F("</fieldset><fieldset><legend>XpressNet Identification</legend>"));
     _printField(c, "xn.version", "Version number");
     _printField(c, "xn.kennung", "Kennung");

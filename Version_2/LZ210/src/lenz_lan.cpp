@@ -642,8 +642,15 @@ void LenzLan::_sendFeedbackBulk(const uint8_t* addr, const uint8_t* data,
 // ─────────────────────────────────────────────────────────────
 //  _checkTimeouts() — disconnect inactive connections
 //
-//  Normal timeout: 30 seconds (LENZ_LAN_TIMEOUT_MS)
-//  Programming-mode timeout: 90 seconds (LENZ_LAN_PROG_TIMEOUT)
+//  Normal timeout: configurable via "xn.lan_timeout_s" (web interface,
+//  XpressNet-LAN section), read live from EEPROM each call so a
+//  change takes effect immediately without a reboot — falls back to
+//  LENZ_LAN_TIMEOUT_DEFAULT_MS (60s) if not set. See that constant's
+//  own comment in lenz_lan.h for why this became configurable (Rob:
+//  Rocrail repeatedly disconnecting while the layout sits idle,
+//  because its own idle-state lifecheck interval turned out to be
+//  longer than the previous fixed 30s).
+//  Programming-mode timeout: 90 seconds (LENZ_LAN_PROG_TIMEOUT).
 //  The PC sends keep-alive messages (F1) to prevent this timeout.
 //
 //  Iterates over every client slot; skips inactive ones. For each
@@ -656,11 +663,13 @@ void LenzLan::_sendFeedbackBulk(const uint8_t* addr, const uint8_t* data,
 // ─────────────────────────────────────────────────────────────
 void LenzLan::_checkTimeouts() {
     uint32_t now = millis();
+    uint32_t normalTimeoutMs = (uint32_t)eepromStore().getUint16(
+        "xn.lan_timeout_s", LENZ_LAN_TIMEOUT_DEFAULT_MS / 1000) * 1000;
     for (uint8_t i = 0; i < LENZ_LAN_MAX_CLIENTS; i++) {
         if (!_clients[i].active) continue;
         uint32_t timeout = _clients[i].progMode
                          ? LENZ_LAN_PROG_TIMEOUT
-                         : LENZ_LAN_TIMEOUT_MS;
+                         : normalTimeoutMs;
         if (now - _clients[i].lastActMs > timeout) {
             _clients[i].tcp.stop();
             _clients[i].active   = false;

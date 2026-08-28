@@ -91,6 +91,19 @@ static DccHal* _instance = nullptr;
 void DccHal::_checkCdeShort() {
     if (!_power) return;             // already off, nothing to do
 
+    // Whether a CDE booster is actually connected at all — EEPROM
+    // "sys.cde_enable" (web interface, Systeem section), default true.
+    // With no booster connected, the E-signal input floats/reads a
+    // permanently low, undefined voltage — this ADC-based detection
+    // would then read "below threshold" continuously and immediately
+    // trip a false short-circuit, forever, with nothing ever able to
+    // clear it (confirmed, Rob). Rather than guessing at a "floating"
+    // voltage signature to distinguish "no booster" from "genuine
+    // short" automatically, this is simply an explicit setting: turn
+    // detection off entirely when there genuinely is no booster wired
+    // up to detect a short circuit from in the first place.
+    if (!eepromStore().getBool("sys.cde_enable", true)) return;
+
     // Multiple throwaway reads, not just one — this specific node has a
     // notably high source impedance (~34K Thevenin, via R704/R705),
     // and the RP2350's ADC sample-and-hold capacitor needs more than a

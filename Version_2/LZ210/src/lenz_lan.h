@@ -34,7 +34,20 @@
 #define LENZ_LAN_HDR1         0xFF     // First header byte (always)
 #define LENZ_LAN_HDR_CMD      0xFE    // Second byte: direct reply
 #define LENZ_LAN_HDR_BC       0xFD    // Second byte: broadcast to all clients
-#define LENZ_LAN_TIMEOUT_MS   30000   // Inactivity timeout (30s, prevented by keep-alive)
+// Default/fallback inactivity timeout — was a fixed 30000 (30s).
+// Configurable via "xn.lan_timeout_s" (web interface, XpressNet-LAN
+// section) — see _checkTimeouts()'s own comment in lenz_lan.cpp.
+// Rob observed Rocrail repeatedly disconnecting/reconnecting while the
+// layout sits genuinely idle (track power on, no trains/turnouts
+// active): Rocrail reconnects, sends one lifecheck (resetting this
+// timer), but its own idle-state check-in interval turned out to be
+// longer than 30s, so the connection dropped again before its next
+// one arrived — the same class of issue as Z21_CLIENT_TIMEOUT being
+// set below the Z21 spec's own required interval. This default is a
+// more conservative starting point; Rob can tune it further by
+// measuring Rocrail's actual idle interval directly via TraceLog's
+// existing "XN-LAN RX" logging.
+#define LENZ_LAN_TIMEOUT_DEFAULT_MS 60000
 #define LENZ_LAN_PROG_TIMEOUT 90000   // Timeout in programming mode (90s)
 #define LENZ_LAN_FRAME_TIMEOUT_MS 250 // Max time allowed for an incomplete frame (spec: "01/01/00")
 
@@ -150,7 +163,8 @@ private:
     // Sends an XpressNet frame to all active clients as a broadcast
     void _sendBroadcast(const XnFrame& f);
 
-    // Disconnects clients that have exceeded LENZ_LAN_TIMEOUT_MS
+    // Disconnects clients that have exceeded the configured inactivity
+    // timeout ("xn.lan_timeout_s", read live from EEPROM)
     void _checkTimeouts();
 };
 
