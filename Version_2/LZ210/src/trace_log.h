@@ -72,6 +72,51 @@
 #define TRACE_LOG_MSG_MAX     160
 #define TRACE_LOG_PORT_DEFAULT 23456
 
+// ─────────────────────────────────────────────────────────────
+//  TraceLevel / TraceSource — added so the volume of TraceLog output
+//  can be filtered independently by severity and by which module
+//  produced it (Rob: wanted to configure "what you want to see" once
+//  the number of instrumented modules — Z21, XpressNet ×3 transports,
+//  LocoNet, H-bridge faults, CDE — made an unfiltered stream busy).
+//
+//  TraceSource is a genuine enum (not a free-text tag, which every
+//  call site used previously) specifically so filtering can be exact
+//  — a typo'd or inconsistently-capitalised string tag would silently
+//  bypass a source-based filter, whereas an unrecognised enum value
+//  simply won't compile. Each source maps to both a fixed, unchanged
+//  print tag (so existing log output — TraceLog viewers, saved logs —
+//  keeps the same format as before) and its own EEPROM enable flag,
+//  via sourceTag()/sourceEepromKey() in trace_log.cpp.
+// ─────────────────────────────────────────────────────────────
+enum class TraceLevel : uint8_t { DEBUG = 0, INFO = 1, WARNING = 2, ERROR = 3 };
+
+enum class TraceSource : uint8_t {
+    SYSTEM = 0,  // bare/TraceSerial-mirrored lines — printed with no tag, exactly as before
+    Z21,
+    XN_LAN,
+    XN_USB,
+    XN_RS485,
+    XN,          // shared XpressNetHandler-level (e.g. LEN-ERR/XOR-ERR, common to every transport)
+    LNET,
+    HBRIDGE,
+    CDE,
+    DCCHAL,
+    _COUNT       // sentinel — must stay last; used for array sizing/iteration only, never logged under
+};
+
+// Short, fixed print tag for a source — e.g. TraceSource::Z21 -> "Z21".
+// TraceSource::SYSTEM maps to "" (no tag at all), matching TraceSerial's
+// existing, unchanged behaviour of mirroring Serial2 lines verbatim.
+const char* traceSourceTag(TraceSource src);
+// EEPROM key used for this source's own "show this source" toggle,
+// e.g. TraceSource::Z21 -> "debug.log_src_z21". Registered/read by
+// LZ210.ino/webserver.cpp — see those files' own TraceLog sections.
+const char* traceSourceEepromKey(TraceSource src);
+// Short, human-readable label for the web interface checkbox next to
+// this source's toggle (a little more descriptive than the print tag
+// alone) — e.g. TraceSource::XN_LAN -> "XpressNet (LAN)".
+const char* traceSourceLabel(TraceSource src);
+
 class TraceLog : public ModuleBase {
 public:
     TraceLog() : ModuleBase("TraceLog", ModuleId::TRACE_LOG, ModuleCore::CORE1) {}
@@ -90,20 +135,32 @@ public:
     // entries to the connected client, if any.
     void loop() override;
 
-    // logf() — cross-core-safe. Formats `fmt` (printf-style) prefixed
-    // with `source` (a short tag identifying the calling module, e.g.
-    // "Z21", "XN-RS485", "LNET") and pushes the result into the ring
-    // buffer. No-op (cheap: one bool check) if logging is currently
-    // disabled. Never blocks; silently drops the message if the ring
-    // buffer is full.
-    void logf(const char* source, const char* fmt, ...);
+    // logf()/logBytes() — level+source-aware primitives. Both check
+    // the configured minimum level ("debug.tcp_log_level") and this
+    // specific source's own enable flag (traceSourceEepromKey())
+    // BEFORE doing any formatting/pushing work at all, so a filtered-
+    // out message costs one level comparison and one EEPROM bool read
+    // — no ring buffer space is spent on messages nobody asked to see
+    // (deliberately filtering at the write side, not the drain side).
+    //
+    // The two-argument (string source, no level) overloads below are
+    // unchanged, pre-existing convenience wrappers for the many
+    // existing call sites that don't need explicit level control —
+    // they default to TraceLevel::INFO and TraceSource::SYSTEM
+    // (unfiltered by source, matching their previous behaviour of
+    // using a free-text tag with no source-based filtering at all).
+    void logf(TraceLevel level, TraceSource source, const char* fmt, ...);
+    void logBytes(TraceLevel level, TraceSource source, const char* direction,
+                  const uint8_t* data, uint8_t len);
 
-    // logBytes() — cross-core-safe convenience for the common "RX/TX
-    // packet dump" case: formats source, direction ("RX"/"TX" or any
-    // other short tag) and the given bytes as a space-separated hex
-    // string, e.g. "[123456] Z21 RX: 53 00 01 A8 FA". Truncates the
-    // byte list (rather than the whole line) if it would not fit in
-    // TRACE_LOG_MSG_MAX.
+    // Backward-compatible convenience wrappers — existing call sites
+    // using a free-text source tag keep compiling unchanged, logged at
+    // TraceLevel::INFO under TraceSource::SYSTEM (so they're subject
+    // to the level filter but not to any PER-SOURCE filter, matching
+    // their previous unfiltered-by-source behaviour). New call sites
+    // should prefer the TraceSource-based overloads above so they can
+    // be filtered individually.
+    void logf(const char* source, const char* fmt, ...);
     void logBytes(const char* source, const char* direction,
                   const uint8_t* data, uint8_t len);
 
@@ -141,6 +198,11 @@ private:
 
     bool _push(const char* text);
     bool _pop(Entry& out);
+
+    // _passesFilter() — the shared level+source check used by both
+    // logf() and logBytes() (the TraceSource-based overloads) before
+    // any formatting work begins.
+    bool _passesFilter(TraceLevel level, TraceSource source);
 
     // _refreshConfig() — called once per loop(), core1 only. Reads
     // "debug.tcp_log_enable"/"debug.tcp_log_port" live from EEPROM;

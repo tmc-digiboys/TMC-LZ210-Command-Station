@@ -110,6 +110,14 @@ void LenzUsb::loop() {
     // Reset on inactivity timeout (longer timeout in programming mode)
     uint32_t timeout = _progMode ? LENZ_USB_PROG_TO : LENZ_USB_TIMEOUT_MS;
     if (_hasActivity && millis() - _lastActMs > timeout) {
+        // Explicit "missed lifecheck" logging — same reasoning as
+        // LenzLan/Z21Lan's equivalent timeout logging (no persistent
+        // "connection" to tear down here, since USB has none, but the
+        // reset of programming-mode/frame state previously happened
+        // silently).
+        traceLog().logf(TraceLevel::WARNING, TraceSource::XN_USB, "TIMEOUT idle=%lums threshold=%lums progMode=%d",
+                         (unsigned long)(millis() - _lastActMs),
+                         (unsigned long)timeout, _progMode);
         _rxLen       = 0;
         _progMode    = false;
         _hasActivity = false;
@@ -214,7 +222,7 @@ void LenzUsb::_processFrame(const uint8_t* buf, uint8_t len) {
     // point this frame (if not interface-local) reaches the shared
     // XpressNetHandler — shared with LenzLan's own equivalent RX log
     // for the same reasoning (Rob).
-    traceLog().logBytes("XN-USB", "RX", buf, len);
+    traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_USB, "RX", buf, len);
     // Lazy-initialise the XpressNet handler on first use.
     // Also send initial RS-Bus feedback state so the PC knows the current
     // state of all active feedback modules immediately after connection.
@@ -273,7 +281,7 @@ void LenzUsb::_processFrame(const uint8_t* buf, uint8_t len) {
         XnFrame f;
         memcpy(f.data, resp, respLen);
         f.len = respLen; f.isBroadcast = false;
-        traceLog().logBytes("XN-USB", "TX", f.data, f.len);
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_USB, "TX", f.data, f.len);
         _sendFrame(f);
     } else if (r == XNHandleResult::OK_SILENT) {
         uint8_t ack[3];
@@ -281,7 +289,7 @@ void LenzUsb::_processFrame(const uint8_t* buf, uint8_t len) {
         XnFrame f;
         memcpy(f.data, ack, ackLen);
         f.len = ackLen; f.isBroadcast = false;
-        traceLog().logBytes("XN-USB", "TX", f.data, f.len);
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_USB, "TX", f.data, f.len);
         _sendFrame(f);
     }
 
@@ -293,7 +301,7 @@ void LenzUsb::_processFrame(const uint8_t* buf, uint8_t len) {
         XnFrame f;
         memcpy(f.data, bc, bcLen);
         f.len = bcLen; f.isBroadcast = true;
-        traceLog().logBytes("XN-USB", "BC", f.data, f.len);
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_USB, "BC", f.data, f.len);
         _sendBroadcast(f);
     }
 }

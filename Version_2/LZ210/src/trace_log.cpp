@@ -9,6 +9,66 @@ TraceLog gTraceLog;
 TraceSerial traceSerial;
 
 // ─────────────────────────────────────────────────────────────
+//  traceSourceTag()/traceSourceEepromKey()/traceSourceLabel() — the
+//  three small per-source lookup tables described in trace_log.h.
+//  Kept as three parallel switch statements (rather than one array of
+//  structs) so adding a new TraceSource only ever needs one line
+//  added to each — a compiler warning on a missing switch case (all
+//  three are exhaustive, no default) catches a forgotten entry rather
+//  than silently returning something wrong for a new source.
+// ─────────────────────────────────────────────────────────────
+const char* traceSourceTag(TraceSource src) {
+    switch (src) {
+        case TraceSource::SYSTEM:   return "";
+        case TraceSource::Z21:      return "Z21";
+        case TraceSource::XN_LAN:   return "XN-LAN";
+        case TraceSource::XN_USB:   return "XN-USB";
+        case TraceSource::XN_RS485: return "XN-RS485";
+        case TraceSource::XN:       return "XN";
+        case TraceSource::LNET:     return "LNET";
+        case TraceSource::HBRIDGE:  return "HBridge";
+        case TraceSource::CDE:      return "CDE";
+        case TraceSource::DCCHAL:   return "DccHal";
+        case TraceSource::_COUNT:   break;  // sentinel, never logged under
+    }
+    return "?";
+}
+
+const char* traceSourceEepromKey(TraceSource src) {
+    switch (src) {
+        case TraceSource::SYSTEM:   return "debug.log_src_system";
+        case TraceSource::Z21:      return "debug.log_src_z21";
+        case TraceSource::XN_LAN:   return "debug.log_src_xnlan";
+        case TraceSource::XN_USB:   return "debug.log_src_xnusb";
+        case TraceSource::XN_RS485: return "debug.log_src_xnrs485";
+        case TraceSource::XN:       return "debug.log_src_xn";
+        case TraceSource::LNET:     return "debug.log_src_lnet";
+        case TraceSource::HBRIDGE:  return "debug.log_src_hbridge";
+        case TraceSource::CDE:      return "debug.log_src_cde";
+        case TraceSource::DCCHAL:   return "debug.log_src_dcchal";
+        case TraceSource::_COUNT:   break;
+    }
+    return "debug.log_src_unknown";
+}
+
+const char* traceSourceLabel(TraceSource src) {
+    switch (src) {
+        case TraceSource::SYSTEM:   return "System (boot log, TraceSerial-mirrored lines)";
+        case TraceSource::Z21:      return "Z21";
+        case TraceSource::XN_LAN:   return "XpressNet (LAN)";
+        case TraceSource::XN_USB:   return "XpressNet (USB)";
+        case TraceSource::XN_RS485: return "XpressNet (RS485)";
+        case TraceSource::XN:       return "XpressNet (shared handler)";
+        case TraceSource::LNET:     return "LocoNet";
+        case TraceSource::HBRIDGE:  return "H-bridge faults";
+        case TraceSource::CDE:      return "CDE booster";
+        case TraceSource::DCCHAL:   return "DccHal commands";
+        case TraceSource::_COUNT:   break;
+    }
+    return "Unknown";
+}
+
+// ─────────────────────────────────────────────────────────────
 //  begin() — core1. Deliberately does nothing beyond what
 //  ModuleBase's own construction already set up: the listening
 //  socket is opened lazily, the first time _refreshConfig() (called
@@ -55,6 +115,35 @@ void TraceLog::loop() {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  _passesFilter() — shared level+source check used by both
+//  TraceSource-based overloads below, before any formatting begins.
+//  Reads "debug.tcp_log_level" (minimum level to show, default INFO —
+//  DEBUG-level messages are opt-in) and this source's own enable flag
+//  (default true — every source shows by default, matching this
+//  facility's pre-filtering behaviour of showing everything once
+//  enabled) live from EEPROM each call, so a change via the web
+//  interface takes effect immediately.
+//
+//  Deliberately does NOT ALSO gate on _enabledCached — see logf()'s
+//  own comment for why messages are always pushed regardless of
+//  whether a viewer is connected yet (preserving the full boot-time
+//  transcript for a later-connecting client). Level/source filtering
+//  is a genuinely separate concern from that: it controls which
+//  messages are considered "wanted" at all, independent of whether
+//  anyone happens to be watching right now.
+// ─────────────────────────────────────────────────────────────
+bool TraceLog::_passesFilter(TraceLevel level, TraceSource source) {
+    // Default minimum level is DEBUG (show everything) — deliberately
+    // NOT INFO, so this filtering feature is purely additive: existing
+    // behaviour (see everything once logging is enabled) is preserved
+    // until the level is actively raised via the web interface, rather
+    // than this addition silently hiding anything by default.
+    uint8_t minLevel = eepromStore().getUint8("debug.tcp_log_level", (uint8_t)TraceLevel::DEBUG);
+    if ((uint8_t)level < minLevel) return false;
+    return eepromStore().getBool(traceSourceEepromKey(source), true);
+}
+
+// ─────────────────────────────────────────────────────────────
 //  logf() — cross-core-safe (see trace_log.h)
 //
 //  Deliberately does NOT gate on _enabledCached before pushing: that
@@ -63,13 +152,43 @@ void TraceLog::loop() {
 //  would silently drop every message logged before that point —
 //  including the earliest boot-time lines (setup()/setup1()), which
 //  is exactly the information Rob wanted preserved even though a
-//  viewer only connects later. Always pushing costs a few bytes of
-//  formatting even while nothing is enabled/connected, which is an
-//  acceptable price for a debug-only facility; only loop() (deciding
-//  whether to open a socket, accept a client, or drain the buffer at
-//  all) actually gates on _enabledCached.
+//  viewer only connects later. Always pushing (once past the level/
+//  source filter above) costs a few bytes of formatting even while
+//  nothing is enabled/connected, which is an acceptable price for a
+//  debug-only facility; only loop() (deciding whether to open a
+//  socket, accept a client, or drain the buffer at all) actually
+//  gates on _enabledCached.
 // ─────────────────────────────────────────────────────────────
+void TraceLog::logf(TraceLevel level, TraceSource source, const char* fmt, ...) {
+    if (!_passesFilter(level, source)) return;
+
+    const char* tag = traceSourceTag(source);
+    char msg[TRACE_LOG_MSG_MAX];
+    int n = 0;
+    if (tag && tag[0]) {
+        n = snprintf(msg, sizeof(msg), "[%lu] %s: ", millis(), tag);
+        if (n < 0) n = 0;
+        if ((size_t)n >= sizeof(msg)) n = sizeof(msg) - 1;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg + n, sizeof(msg) - (size_t)n, fmt, args);
+    va_end(args);
+
+    _push(msg);
+}
+
 void TraceLog::logf(const char* source, const char* fmt, ...) {
+    // Backward-compatible string-tag wrapper — see trace_log.h's own
+    // comment on these overloads. Formats the message itself (rather
+    // than forwarding to the TraceSource-based logf() above, which
+    // isn't possible with a bare "..." parameter pack without a
+    // second va_list round-trip) so existing call sites' free-text
+    // tag is preserved exactly as before; only the level/SYSTEM-source
+    // filter now additionally applies.
+    if (!_passesFilter(TraceLevel::INFO, TraceSource::SYSTEM)) return;
+
     char msg[TRACE_LOG_MSG_MAX];
     int n = 0;
     if (source && source[0]) {
@@ -91,8 +210,34 @@ void TraceLog::logf(const char* source, const char* fmt, ...) {
 //  logf() for not gating on _enabledCached here — see that function's
 //  comment.
 // ─────────────────────────────────────────────────────────────
+void TraceLog::logBytes(TraceLevel level, TraceSource source, const char* direction,
+                         const uint8_t* data, uint8_t len) {
+    if (!_passesFilter(level, source)) return;
+
+    char msg[TRACE_LOG_MSG_MAX];
+    int n = snprintf(msg, sizeof(msg), "[%lu] %s %s: ", millis(),
+                      traceSourceTag(source), direction ? direction : "");
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof(msg)) n = sizeof(msg) - 1;
+
+    uint8_t i = 0;
+    for (; i < len; i++) {
+        if ((size_t)n + 3 >= sizeof(msg)) break;
+        n += snprintf(msg + n, sizeof(msg) - (size_t)n, "%02X ", data[i]);
+    }
+    if (i < len) {
+        snprintf(msg + n, sizeof(msg) - (size_t)n, "...(%u more)", len - i);
+    }
+
+    _push(msg);
+}
+
 void TraceLog::logBytes(const char* source, const char* direction,
                          const uint8_t* data, uint8_t len) {
+    // Backward-compatible string-tag wrapper — see trace_log.h's own
+    // comment on these overloads.
+    if (!_passesFilter(TraceLevel::INFO, TraceSource::SYSTEM)) return;
+
     char msg[TRACE_LOG_MSG_MAX];
     int n = snprintf(msg, sizeof(msg), "[%lu] %s %s: ", millis(),
                       source ? source : "", direction ? direction : "");

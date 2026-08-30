@@ -429,7 +429,7 @@ void LenzLan::_processFrame(LenzClient& c, const uint8_t* buf, uint8_t len) {
     // xn_interface_layer.cpp, since that's shared by both LenzLan and
     // LenzUsb and is a more precise point than logging here a second
     // time (Rob).
-    traceLog().logBytes("XN-LAN", "RX", buf, len);
+    traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_LAN, "RX", buf, len);
     uint8_t  resp[24];
     uint8_t  respLen = 0;
     XNHandleResult r = _ifLayer.process(sXpressNet, buf, len, resp, respLen,
@@ -439,7 +439,7 @@ void LenzLan::_processFrame(LenzClient& c, const uint8_t* buf, uint8_t len) {
         XnFrame f;
         memcpy(f.data, resp, respLen);
         f.len = respLen; f.isBroadcast = false;
-        traceLog().logBytes("XN-LAN", "TX", f.data, f.len);
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_LAN, "TX", f.data, f.len);
         _sendFrame(c, f);
     } else if (r == XNHandleResult::OK_SILENT) {
         uint8_t ack[3];
@@ -447,7 +447,7 @@ void LenzLan::_processFrame(LenzClient& c, const uint8_t* buf, uint8_t len) {
         XnFrame f;
         memcpy(f.data, ack, ackLen);
         f.len = ackLen; f.isBroadcast = false;
-        traceLog().logBytes("XN-LAN", "TX", f.data, f.len);
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_LAN, "TX", f.data, f.len);
         _sendFrame(c, f);
     }
 
@@ -459,7 +459,7 @@ void LenzLan::_processFrame(LenzClient& c, const uint8_t* buf, uint8_t len) {
         XnFrame f;
         memcpy(f.data, bc, bcLen);
         f.len = bcLen; f.isBroadcast = true;
-        traceLog().logBytes("XN-LAN", "BC", f.data, f.len);
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_LAN, "BC", f.data, f.len);
         _sendBroadcast(f);
     }
 }
@@ -670,7 +670,21 @@ void LenzLan::_checkTimeouts() {
         uint32_t timeout = _clients[i].progMode
                          ? LENZ_LAN_PROG_TIMEOUT
                          : normalTimeoutMs;
-        if (now - _clients[i].lastActMs > timeout) {
+        uint32_t idleMs = now - _clients[i].lastActMs;
+        if (idleMs > timeout) {
+            // Explicit "missed lifecheck" logging — until now, a
+            // timeout-triggered disconnect left no trace at all beyond
+            // the client's own connection simply vanishing; diagnosing
+            // the earlier LENZ_LAN_TIMEOUT_MS-too-short issue (Rob)
+            // relied entirely on separately comparing Rocrail's own
+            // logged reconnect attempts against our timeout value by
+            // hand. Logs which client (IP:port), how long it had
+            // genuinely been idle, and the threshold that was in
+            // effect, so this is directly visible going forward.
+            IPAddress ip = _clients[i].tcp.remoteIP();
+            traceLog().logf(TraceLevel::WARNING, TraceSource::XN_LAN, "TIMEOUT %d.%d.%d.%d:%u idle=%lums threshold=%lums",
+                             ip[0], ip[1], ip[2], ip[3], _clients[i].tcp.remotePort(),
+                             (unsigned long)idleMs, (unsigned long)timeout);
             _clients[i].tcp.stop();
             _clients[i].active   = false;
             _clients[i].progMode = false;

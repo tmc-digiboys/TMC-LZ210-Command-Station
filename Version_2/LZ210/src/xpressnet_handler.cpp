@@ -1533,8 +1533,22 @@ XNHandleResult XpressNetHandler::process(const uint8_t* in, uint8_t il,
     // traffic on the bus.
     gLeds.onXpnBusTraffic();
     l = 0;
-    if (il < 2)              { l = buildError(r, 0x82); return XNHandleResult::ERROR; }
-    if (!verifyXor(in, il))  { l = buildError(r, 0x80); return XNHandleResult::REPLY; }
+    // Explicit error-condition logging — previously these failures
+    // only showed up implicitly, if at all, in whichever transport's
+    // own generic RX log happened to be enabled: nothing flagged that
+    // a frame was actually rejected, or why, so spotting a genuine
+    // XOR/length problem meant re-computing the checksum by hand
+    // against the raw bytes (Rob). One shared log point here covers
+    // every transport, since they all funnel through this same
+    // process() regardless of origin.
+    if (il < 2) {
+        traceLog().logBytes(TraceLevel::ERROR, TraceSource::XN, "LEN-ERR", in, il);
+        l = buildError(r, 0x82); return XNHandleResult::ERROR;
+    }
+    if (!verifyXor(in, il)) {
+        traceLog().logBytes(TraceLevel::ERROR, TraceSource::XN, "XOR-ERR", in, il);
+        l = buildError(r, 0x80); return XNHandleResult::REPLY;
+    }
 
     uint8_t h  = in[0];
     uint8_t id = in[1];

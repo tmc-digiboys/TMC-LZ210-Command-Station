@@ -30,21 +30,21 @@ SlotServer::SlotServer(LocoNetDispatcher& dispatcher,
                        EventBus&          evtBus)
     : _repo(repo), _cmdBus(cmdBus), _evtBus(evtBus)
 {
-    dispatcher.onPacket(OPC_LOCO_ADR,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleLocoAdr    (dispatcher,p); });
-    dispatcher.onPacket(OPC_MOVE_SLOTS,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleMoveSlots  (dispatcher,p); });
-    dispatcher.onPacket(OPC_RQ_SL_DATA,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleRqSlotData (dispatcher,p); });
-    dispatcher.onPacket(OPC_WR_SL_DATA,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleWrSlotData (dispatcher,p); });
-    dispatcher.onPacket(OPC_SLOT_STAT1,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleSlotStat1  (dispatcher,p); });
-    dispatcher.onPacket(OPC_LOCO_SPD,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleLocoSpd    (dispatcher,p); });
-    dispatcher.onPacket(OPC_LOCO_DIRF,    [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleLocoDirf   (dispatcher,p); });
-    dispatcher.onPacket(OPC_LOCO_SND,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleLocoSnd    (dispatcher,p); });
-    dispatcher.onPacket(OPC_CONSIST_FUNC, [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleConsistFunc(dispatcher,p); });
-    dispatcher.onPacket(OPC_LINK_SLOTS,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleLinkSlots  (dispatcher,p); });
-    dispatcher.onPacket(OPC_UNLINK_SLOTS, [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleUnlinkSlots(dispatcher,p); });
-    dispatcher.onPacket(OPC_SW_REQ,       [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleSwReq      (dispatcher,p); });
-    dispatcher.onPacket(OPC_SW_STATE,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleSwState    (dispatcher,p); });
-    dispatcher.onPacket(OPC_SW_ACK,       [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleSwAck      (dispatcher,p); });
-    dispatcher.onPacket(OPC_GPON,         [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleGpOn       (dispatcher,p); });
+    dispatcher.onPacket(OPC_LOCO_ADR,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleLocoAdr    (dispatcher,p); });
+    dispatcher.onPacket(OPC_MOVE_SLOTS,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleMoveSlots  (dispatcher,p); });
+    dispatcher.onPacket(OPC_RQ_SL_DATA,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleRqSlotData (dispatcher,p); });
+    dispatcher.onPacket(OPC_WR_SL_DATA,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleWrSlotData (dispatcher,p); });
+    dispatcher.onPacket(OPC_SLOT_STAT1,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleSlotStat1  (dispatcher,p); });
+    dispatcher.onPacket(OPC_LOCO_SPD,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleLocoSpd    (dispatcher,p); });
+    dispatcher.onPacket(OPC_LOCO_DIRF,    [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleLocoDirf   (dispatcher,p); });
+    dispatcher.onPacket(OPC_LOCO_SND,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleLocoSnd    (dispatcher,p); });
+    dispatcher.onPacket(OPC_CONSIST_FUNC, [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleConsistFunc(dispatcher,p); });
+    dispatcher.onPacket(OPC_LINK_SLOTS,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleLinkSlots  (dispatcher,p); });
+    dispatcher.onPacket(OPC_UNLINK_SLOTS, [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleUnlinkSlots(dispatcher,p); });
+    dispatcher.onPacket(OPC_SW_REQ,       [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleSwReq      (dispatcher,p); });
+    dispatcher.onPacket(OPC_SW_STATE,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleSwState    (dispatcher,p); });
+    dispatcher.onPacket(OPC_SW_ACK,       [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleSwAck      (dispatcher,p); });
+    dispatcher.onPacket(OPC_GPON,         [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleGpOn       (dispatcher,p); });
     // OPC_A3: F9-F12 (Uhlenbrock/Intellibox extension, also used by FRED)
     // NOTE: unlike every other opcode registered above, 0xA3 is NOT part
     // of the Digitrax LocoNet(r) Personal Use Edition 1.0 specification
@@ -53,9 +53,9 @@ SlotServer::SlotServer(LocoNetDispatcher& dispatcher,
     // "Intellibox II"), which has since become a de-facto standard also
     // used by other devices such as the FREMO Fred. See _handleLocoF9F12()
     // below for the full note.
-    dispatcher.onPacket(0xA3,             [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleLocoF9F12  (dispatcher,p); });
-    dispatcher.onPacket(OPC_GPOFF,        [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleGpOff      (dispatcher,p); });
-    dispatcher.onPacket(OPC_IDLE,         [this,&dispatcher](const LnMsg* p){ traceLog().logBytes("LNET", "RX", p->data, p->length()); _handleIdle       (dispatcher,p); });
+    dispatcher.onPacket(0xA3,             [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleLocoF9F12  (dispatcher,p); });
+    dispatcher.onPacket(OPC_GPOFF,        [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleGpOff      (dispatcher,p); });
+    dispatcher.onPacket(OPC_IDLE,         [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleIdle       (dispatcher,p); });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -88,7 +88,7 @@ void SlotServer::_flushQueue(LocoNetDispatcher& dispatcher)
         LnMsg& msg = _txQueue[_txHead];
         LN_STATUS s = dispatcher.send(&msg);
         if (s != LN_IDLE) break;  // bus still busy, try again next loop
-        traceLog().logBytes("LNET", "TX", msg.data, msg.length());
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "TX", msg.data, msg.length());
         _txHead = (_txHead + 1) % LN_TX_QUEUE_SIZE;
     }
 }

@@ -130,7 +130,7 @@ void DccHal::_checkCdeShort() {
     static bool lastBelow = false;
     if (belowThreshold != lastBelow) {
         lastBelow = belowThreshold;
-        traceLog().logf("CDE", "mv=%u threshold=%u below=%d faultSinceUs=%lu",
+        traceLog().logf(TraceLevel::INFO, TraceSource::CDE, "mv=%u threshold=%u below=%d faultSinceUs=%lu",
                          mv, thresholdMv, belowThreshold,
                          (unsigned long)_cdeFaultSinceUs);
     }
@@ -145,7 +145,7 @@ void DccHal::_checkCdeShort() {
         if (_cdeRecoverSinceUs == 0) { _cdeRecoverSinceUs = micros(); return; }
         uint16_t clearUs = eepromStore().getUint16("sys.cde_clear_us", CDE_CLEAR_US);
         if ((micros() - _cdeRecoverSinceUs) >= clearUs) {
-            traceLog().logf("CDE", "CLEARED after %lu us above threshold", (unsigned long)clearUs);
+            traceLog().logf(TraceLevel::WARNING, TraceSource::CDE, "CLEARED after %lu us above threshold", (unsigned long)clearUs);
             _cdeFaultSinceUs   = 0;
             _cdeRecoverSinceUs = 0;
         }
@@ -420,8 +420,16 @@ void DccHal::loop() {
     _checkCdeShort();   // CDE booster short-circuit detection via GP05
 
     // v2 hardware: nFAULT (short-circuit/overcurrent) on all three
-    // bridges. Every debounced fault edge is logged, and two
-    // independent signals can each trigger a station-wide power-off:
+    // bridges. Every debounced fault edge is logged via TraceLog
+    // (previously this comment's own claim was aspirational, not
+    // actually true — an isolated blip that never escalated produced
+    // no log line at all, due to a short-circuiting "&&" that gated
+    // the log on shouldEscalate() too; fixed below, Rob: needed
+    // visibility into individually-harmless blips to diagnose trains
+    // repeatedly stopping/track power dropping, suspected to be too
+    // many small nFAULT events even though none was escalating on its
+    // own). Two independent signals can each trigger a station-wide
+    // power-off:
     // repeated faults within a short window (shouldEscalate()), or
     // nFAULT observed continuously low for at least a duration
     // threshold (checkDuration()) — see HBridgeFault's comments for
@@ -432,24 +440,75 @@ void DccHal::loop() {
     // (confirmed empirically — a real short stopped escalating once
     // that check alone was in place), so checkDuration() catches it
     // independently via raw continuous-low time instead. An isolated
-    // blip triggers neither. All thresholds are EEPROM-configurable
-    // (web interface), shared across all three bridges rather than
-    // per-bridge, to keep this one tunable policy rather than three
-    // separate ones.
+    // blip is logged but triggers neither escalation path. All
+    // thresholds are EEPROM-configurable (web interface), shared
+    // across all three bridges rather than per-bridge, to keep this
+    // one tunable policy rather than three separate ones.
     uint32_t faultWindowMs   = eepromStore().getUint32("sys.fault_window_ms", 1000);
     uint8_t  faultRetryCnt   = eepromStore().getUint8("sys.fault_retry_count", 3);
     uint32_t faultDurationMs = eepromStore().getUint32("sys.fault_duration_ms", 50);
-    if (_faultDcc.check() && _faultDcc.shouldEscalate(faultWindowMs, faultRetryCnt))
+    // Recovery-confirm debounce for checkDuration() below — same
+    // reasoning as CDE_CLEAR_US (dcc_hal.h)/"sys.cde_clear_us": a
+    // storm of closely-spaced fault blips (Rob, TraceLog: a ~2-second
+    // run of individual "fault edge" events with no escalation at
+    // all) needs the pin to read genuinely HIGH for at least this long
+    // before checkDuration() treats it as recovered, rather than
+    // resetting on the very first HIGH sample caught between blips.
+    uint32_t faultClearMs    = eepromStore().getUint32("sys.fault_clear_ms", 10);
+
+    // check() must be captured once per bridge and reused as the gate
+    // for shouldEscalate() below (not called again/separately) —
+    // shouldEscalate() only looks at already-recorded history and is
+    // otherwise stateless, so without this gate it would re-evaluate
+    // true on every single loop() iteration for as long as the window/
+    // count condition holds, re-triggering _checkHBridgeFault()
+    // repeatedly instead of once at the moment a new qualifying edge
+    // occurs.
+    //
+    // Logging every individual debounced fault edge here too — a
+    // previous version only acted on (and therefore only logged) an
+    // edge if it ALSO happened to satisfy shouldEscalate() in the same
+    // call, via a short-circuiting "&&": an isolated blip that never
+    // escalated produced no log line at all, despite this section's
+    // own comment above claiming otherwise. Logged separately, before
+    // the escalation check, so a genuine pattern of frequent-but-
+    // individually-harmless blips (Rob: trains repeatedly stopping,
+    // track power going out — suspected too many small nFAULT events
+    // even though none is individually escalating) becomes visible via
+    // TraceLog, one line per H-bridge (name() distinguishes DCC/SM/CDE).
+    bool dccEdge = _faultDcc.check();
+    bool smEdge  = _faultSm.check();
+    bool cdeEdge = _faultCde.check();
+    if (dccEdge) traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultDcc.name());
+    if (smEdge)  traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultSm.name());
+    if (cdeEdge) traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultCde.name());
+
+    if (dccEdge && _faultDcc.shouldEscalate(faultWindowMs, faultRetryCnt)) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count within window)", _faultDcc.name());
         _checkHBridgeFault(_faultDcc);
-    if (_faultDcc.checkDuration(faultDurationMs)) _checkHBridgeFault(_faultDcc);
+    }
+    if (_faultDcc.checkDuration(faultDurationMs, faultClearMs)) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultDcc.name());
+        _checkHBridgeFault(_faultDcc);
+    }
 
-    if (_faultSm.check() && _faultSm.shouldEscalate(faultWindowMs, faultRetryCnt))
+    if (smEdge && _faultSm.shouldEscalate(faultWindowMs, faultRetryCnt)) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count within window)", _faultSm.name());
         _checkHBridgeFault(_faultSm);
-    if (_faultSm.checkDuration(faultDurationMs)) _checkHBridgeFault(_faultSm);
+    }
+    if (_faultSm.checkDuration(faultDurationMs, faultClearMs)) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultSm.name());
+        _checkHBridgeFault(_faultSm);
+    }
 
-    if (_faultCde.check() && _faultCde.shouldEscalate(faultWindowMs, faultRetryCnt))
+    if (cdeEdge && _faultCde.shouldEscalate(faultWindowMs, faultRetryCnt)) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count within window)", _faultCde.name());
         _checkHBridgeFault(_faultCde);
-    if (_faultCde.checkDuration(faultDurationMs)) _checkHBridgeFault(_faultCde);
+    }
+    if (_faultCde.checkDuration(faultDurationMs, faultClearMs)) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultCde.name());
+        _checkHBridgeFault(_faultCde);
+    }
 
     // v2 hardware: ACK detection on all three bridges — only the one
     // actually routed to the track during service mode (currently
@@ -483,7 +542,7 @@ void DccHal::_onCommand(const Command& cmd) {
     // RX/-> XN logs already in each protocol handler, this closes the
     // loop end-to-end: raw bytes in -> XpressNetHandler -> CommandBus
     // -> here -> actual DCC output (Rob).
-    traceLog().logf("DccHal",
+    traceLog().logf(TraceLevel::DEBUG, TraceSource::DCCHAL,
         "CMD type=%d src=%u addr=%u speed=%u fwd=%d step=%u fn=%u fnSt=%d out=%u act=%d cv=%u cvVal=%u",
         (int)cmd.type, cmd.sourceId, cmd.address, cmd.speed, cmd.forward,
         cmd.stepMode, cmd.fn, cmd.fnState, cmd.output, cmd.active,

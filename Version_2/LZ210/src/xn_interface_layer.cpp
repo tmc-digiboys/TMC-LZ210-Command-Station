@@ -135,7 +135,8 @@ XNHandleResult XnInterfaceLayer::process(XpressNetHandler& handler,
     // transport this instance serves (LenzLan or LenzUsb both call
     // through this same process() — handler.srcId() distinguishes
     // them so the log line is labelled correctly either way) (Rob).
-    traceLog().logBytes(handler.srcId() == ModuleId::LENZ_USB ? "XN-USB" : "XN-LAN",
+    traceLog().logBytes(TraceLevel::DEBUG,
+                         handler.srcId() == ModuleId::LENZ_USB ? TraceSource::XN_USB : TraceSource::XN_LAN,
                          "-> XN", in, il);
     return handler.process(in, il, r, l);
 }

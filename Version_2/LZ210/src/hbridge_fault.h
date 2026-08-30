@@ -133,9 +133,33 @@ public:
     // thresholdMs is EEPROM-configurable (see DccHal::loop()) —
     // Rob may need to tune this empirically (LSA/scope) against the
     // DRV887x's actual retry-cycle timing on this board.
-    bool checkDuration(uint32_t thresholdMs) {
+    //
+    // clearMs — recovery-confirm debounce, same reasoning as CDE_CLEAR_US
+    // (dcc_hal.h): confirmed via TraceLog (Rob) that a genuine, sustained
+    // fault condition can present as a dense STORM of brief nFAULT blips
+    // (a ~2-second run of individually-debounced "fault edge" events was
+    // observed with NO escalation at all, while a much shorter, ~4-edge
+    // burst elsewhere DID escalate) — the original, unconditional
+    // "if (!faultNow) resetToZero" meant any single HIGH sample caught
+    // between two closely-spaced blips wiped out all accumulated
+    // duration, so a storm of brief blips could paradoxically go
+    // undetected here even though it represents a WORSE underlying
+    // condition than an isolated blip. Only treats the pin as genuinely
+    // recovered — resetting the duration window — once it has read HIGH
+    // continuously for at least clearMs, mirroring exactly how
+    // _checkCdeShort() was fixed for the same failure mode.
+    bool checkDuration(uint32_t thresholdMs, uint32_t clearMs = 10) {
         bool faultNow = (digitalRead(_pin) == LOW);
-        if (!faultNow) { _durationSinceMs = 0; return false; }
+        if (!faultNow) {
+            if (_durationSinceMs == 0) return false;  // not in a fault window anyway
+            if (_recoverSinceMs == 0) { _recoverSinceMs = millis(); return false; }
+            if ((millis() - _recoverSinceMs) >= clearMs) {
+                _durationSinceMs = 0;
+                _recoverSinceMs  = 0;
+            }
+            return false;
+        }
+        _recoverSinceMs = 0;  // still faulted — cancel any pending recovery
         if (_durationSinceMs == 0) { _durationSinceMs = millis(); return false; }
         return (millis() - _durationSinceMs) >= thresholdMs;
     }
@@ -165,6 +189,10 @@ private:
     // Timestamp the pin was first observed continuously low, used by
     // checkDuration() above. 0 means "not currently in a low stretch".
     uint32_t _durationSinceMs = 0;
+    // Timestamp the pin was most recently observed HIGH while already
+    // in a fault window (checkDuration()'s clearMs debounce). 0 means
+    // "not currently tracking a pending recovery".
+    uint32_t _recoverSinceMs  = 0;
 
     void _recordFault() {
         _history[_historyHead] = millis();

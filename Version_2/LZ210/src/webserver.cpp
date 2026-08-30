@@ -528,6 +528,7 @@ void Webserver::_panelSysteem(EthernetClient& c) {
     _printField(c, "sys.fault_window_ms",   "Window (ms)");
     _printField(c, "sys.fault_retry_count", "Faults within window to escalate");
     _printField(c, "sys.fault_duration_ms", "Continuous-low duration to escalate (ms)");
+    _printField(c, "sys.fault_clear_ms", "Recovery-confirm debounce (ms)");
     c.print(F("</fieldset>"
               "<button class='btn'>Save</button></form>"));
 
@@ -668,6 +669,16 @@ void Webserver::_panelTraceLog(EthernetClient& c) {
     c.print(F("<fieldset><legend>TCP Stream</legend>"));
     _printField(c, "debug.tcp_log_enable", "Enabled");
     _printField(c, "debug.tcp_log_port",   "TCP port");
+    c.print(F("</fieldset><fieldset><legend>Filtering</legend>"
+              "<p class='hint'>Controls which lines are kept at all — "
+              "filtered-out lines are never even written into the log "
+              "buffer, so they don't compete for space with what you "
+              "actually want to see.</p>"));
+    _printField(c, "debug.tcp_log_level", "Minimum level");
+    for (uint8_t i = 0; i < (uint8_t)TraceSource::_COUNT; i++) {
+        TraceSource src = (TraceSource)i;
+        _printField(c, traceSourceEepromKey(src), traceSourceLabel(src));
+    }
     c.print(F("</fieldset><button class='btn'>Save</button></form>"));
 
     c.print(F("<fieldset><legend>Status</legend><table>"

@@ -151,7 +151,7 @@ void Z21Lan::_processPacket(const uint8_t* buf, uint16_t len,
     // duplication for that one case, in exchange for every OTHER
     // top-level command (previously entirely uncovered, e.g. RS-Bus's
     // own direct GETDATA request/reply — Rob) now being logged too.
-    traceLog().logBytes("Z21", "RX", buf, len);
+    traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "RX", buf, len);
 
     switch (hdr) {
         case Z21Hdr::LAN_GET_SERIAL_NUMBER:  _handleLanGetSerialNumber(*c); break;
@@ -378,7 +378,7 @@ void Z21Lan::_handleXBus(Z21Client& c,
     // Generic RX log — every LAN_X command reaching this read handler,
     // regardless of type, logged once here rather than piecemeal at
     // each individual command's own handling further down (Rob).
-    traceLog().logBytes("Z21", "RX", data, len);
+    traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "RX", data, len);
     if (!sZ21Init) {
         sZ21XpressNet.begin(ModuleId::Z21_LAN);
         // locoAddr != 0 marks this as a broadcast ABOUT a specific
@@ -402,7 +402,7 @@ void Z21Lan::_handleXBus(Z21Client& c,
             uint8_t buf[Z21_UDP_BUF]; uint16_t rlen = 0;
             if (locoAddr != 0) {
                 gZ21Lan._buildLocoInfo(buf, rlen, locoAddr);
-                traceLog().logBytes("Z21", "BC", buf, rlen);
+                traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "BC", buf, rlen);
                 gZ21Lan._broadcast(buf, rlen, Z21BcFlag::DRIVING_LOCO | Z21BcFlag::SYSTEM_STATE);
                 return;
             }
@@ -416,7 +416,7 @@ void Z21Lan::_handleXBus(Z21Client& c,
                 uint32_t flag = (dlen >= 1 && bdata[0] == 0x43)
                                 ? Z21BcFlag::DRIVING_LOCO
                                 : (Z21BcFlag::DRIVING_LOCO | Z21BcFlag::SYSTEM_STATE);
-                traceLog().logBytes("Z21", "BC", buf, rlen);
+                traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "BC", buf, rlen);
                 gZ21Lan._broadcast(buf, rlen, flag);
             }
         });
@@ -504,7 +504,7 @@ void Z21Lan::_handleXBus(Z21Client& c,
     // format difference above). One log point covers every command
     // type reaching XpressNetHandler, rather than needing its own
     // line added per command as new ones are handled (Rob).
-    traceLog().logBytes("Z21", "-> XN", procData, procLen);
+    traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "-> XN", procData, procLen);
 
     XNHandleResult r = sZ21XpressNet.process(procData, procLen, resp, respLen);
     // LAN_X_SET_LOCO_DRIVE (X-Header 0xE4, DB0=0x1S), LAN_X_SET_LOCO_
@@ -528,7 +528,7 @@ void Z21Lan::_handleXBus(Z21Client& c,
         uint16_t addr = XpressNetHandler::decodeAddr(data[2], data[3]);
         uint16_t rlen = 0;
         _buildLocoInfo(_txBuf, rlen, addr);
-        traceLog().logBytes("Z21", "TX", _txBuf, rlen);
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "TX", _txBuf, rlen);
         _send(c, _txBuf, rlen);
         return;
     }
@@ -540,7 +540,7 @@ void Z21Lan::_handleXBus(Z21Client& c,
             XnFrame f; memcpy(f.data, resp, respLen);
             f.len = respLen; f.isBroadcast = false;
             uint16_t rlen = 0; _buildXBusReply(_txBuf, rlen, f);
-            traceLog().logBytes("Z21", "TX", _txBuf, rlen);
+            traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "TX", _txBuf, rlen);
             _send(c, _txBuf, rlen);
         } else if (isTurnout && procLen >= 4) {
             // Send LAN_X_TURNOUT_INFO back — address already correct in procData
@@ -562,7 +562,7 @@ void Z21Lan::_handleXBus(Z21Client& c,
             xn[4] = XpressNetHandler::xorCheck(xn, 4);
             XnFrame f; memcpy(f.data, xn, 5); f.len=5; f.isBroadcast=true;
             uint16_t rlen=0; _buildXBusReply(_txBuf, rlen, f);
-            traceLog().logBytes("Z21", "BC", _txBuf, rlen);
+            traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "BC", _txBuf, rlen);
             _broadcast(_txBuf, rlen, Z21BcFlag::DRIVING_LOCO);
         }
     }
@@ -693,7 +693,7 @@ void Z21Lan::_handleRmbusGetData(Z21Client& c, const uint8_t* data, uint8_t len)
             buf[5 + i] = (n1 << 4) | (n0 & 0x0F);
         }
     }
-    traceLog().logBytes("Z21", "TX", buf, 15);
+    traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "TX", buf, 15);
     _send(c, buf, 15);
 }
 
@@ -1063,7 +1063,7 @@ void Z21Lan::onEvent(const Event& ev) {
         // actually built and sent (Rob: RS-Bus broadcasts weren't
         // visible in TraceLog despite the rest of Z21 traffic being
         // covered).
-        traceLog().logBytes("Z21", "BC", payload, 14);
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "BC", payload, 14);
         for (uint8_t i = 0; i < Z21_MAX_CLIENTS; i++) {
             if (_clients[i].active)
                 _send(_clients[i], payload, 14);
@@ -1226,6 +1226,14 @@ void Z21Lan::_checkTimeouts() {
     for (uint8_t i = 0; i < Z21_MAX_CLIENTS; i++) {
         if (_clients[i].active &&
             now - _clients[i].lastSeenMs > timeoutMs) {
+            // Explicit "missed lifecheck" logging — same reasoning as
+            // LenzLan's equivalent (lenz_lan.cpp): a timeout-triggered
+            // client drop previously left no trace at all.
+            IPAddress ip = _clients[i].ip;
+            uint32_t idleMs = now - _clients[i].lastSeenMs;
+            traceLog().logf(TraceLevel::WARNING, TraceSource::Z21, "TIMEOUT %d.%d.%d.%d:%u idle=%lums threshold=%lums",
+                             ip[0], ip[1], ip[2], ip[3], _clients[i].port,
+                             (unsigned long)idleMs, (unsigned long)timeoutMs);
             _clients[i].active = false;
             _clients[i].bcFlags = 0;
             _clientCount--;

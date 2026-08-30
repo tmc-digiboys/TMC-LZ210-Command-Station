@@ -527,6 +527,11 @@ void _registerDefaultParams() {
     // check above, under automatic-retry). May need empirical tuning
     // (LSA/scope) against this board's actual DRV887x retry timing.
     store.registerUint32("sys.fault_duration_ms", 50,  ModuleId::DCC_HAL);
+    // Recovery-confirm debounce for checkDuration() above — see that
+    // function's own comment in hbridge_fault.h. Rob may need to tune
+    // this against the actual spacing between blips in a genuine,
+    // sustained fault storm (TraceLog, HBridge source).
+    store.registerUint32("sys.fault_clear_ms", 10, ModuleId::DCC_HAL);
     store.registerString("net.subnet",   "255.255.255.0",      16, 0);
     store.registerBool  ("net.dhcp",     true,                     0);
     store.registerUint16("lenz.port",    5550,  ModuleId::LENZ_LAN);
@@ -602,6 +607,29 @@ void _registerDefaultParams() {
     // protocol server). See trace_log.h for the full design.
     store.registerBool  ("debug.tcp_log_enable", false, ModuleId::TRACE_LOG);
     store.registerUint16("debug.tcp_log_port", TRACE_LOG_PORT_DEFAULT, ModuleId::TRACE_LOG);
+    // Minimum level to show — TraceLevel enum (trace_log.h): 0=DEBUG,
+    // 1=INFO, 2=WARNING, 3=ERROR. Default INFO, so DEBUG-level detail
+    // is opt-in.
+    static const char* const kTraceLevelOpts[] = {
+        "Debug (all detail)",
+        "Info (default)",
+        "Warning",
+        "Error",
+        nullptr
+    };
+    store.registerEnum("debug.tcp_log_level", ModuleId::TRACE_LOG,
+                        (uint8_t)TraceLevel::DEBUG, kTraceLevelOpts);
+    // One enable flag per TraceSource (Rob: wanted to filter "per
+    // bron" independently of level) — registered via a loop over the
+    // enum, rather than one hand-written registerBool() call per
+    // source, so a new TraceSource added to trace_log.h only ever
+    // needs its one switch-case entry added there; this loop picks it
+    // up automatically. Default true (every source shows once logging
+    // itself is enabled), matching this facility's behaviour before
+    // per-source filtering existed at all.
+    for (uint8_t i = 0; i < (uint8_t)TraceSource::_COUNT; i++) {
+        store.registerBool(traceSourceEepromKey((TraceSource)i), true, ModuleId::TRACE_LOG);
+    }
     store.load();
 }
 

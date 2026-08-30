@@ -486,7 +486,7 @@ void XpressNetRs485::_processSlaveReply(uint8_t addr,
     // Generic RX log — same two-point pattern as the other transports
     // (Z21, XpressNet-LAN/USB): every reply reaching this handler from
     // a polled RS485 slave, before any processing (Rob).
-    traceLog().logBytes("XN-RS485", "RX", buf, len);
+    traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_RS485, "RX", buf, len);
     uint8_t h = buf[0];
 
     // Programming-mode tracking
@@ -523,7 +523,7 @@ void XpressNetRs485::_processSlaveReply(uint8_t addr,
     // (no address remapping needed for this transport, unlike Z21's
     // turnout FAdr conversion) — logged again anyway for consistency
     // with the same two-point pattern used everywhere else (Rob).
-    traceLog().logBytes("XN-RS485", "-> XN", buf, len);
+    traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_RS485, "-> XN", buf, len);
     XNHandleResult r = sRs485Handler.process(buf, len, resp, respLen);
 
     if ((r == XNHandleResult::REPLY || r == XNHandleResult::ERROR) && respLen > 0) {
