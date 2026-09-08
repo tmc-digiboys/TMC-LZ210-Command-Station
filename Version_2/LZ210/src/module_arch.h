@@ -65,6 +65,7 @@ namespace ModuleId {
     constexpr uint8_t EEPROM_STORE    = 0x30;  // EepromStore LittleFS (core0/1)
     constexpr uint8_t POWER_MONITOR   = 0x07;  // PowerMonitor — VIN/12V/5V rail monitoring (core0, v2 hardware only)
     constexpr uint8_t TRACE_LOG       = 0x40;  // TraceLog TCP debug stream (core1)
+    constexpr uint8_t LN_TCP          = 0x13;  // LocoNet-over-TCP server, a.k.a. LbServer (core1)
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -131,6 +131,24 @@ private:
 
     // Throttle timer for 10ms poll interval
     uint32_t _lastPollMs = 0;
+
+    // Watchdog: last time genuine RS-Bus traffic (any address) was
+    // actually seen, and whether we are currently expected to be
+    // receiving any (track power on) — see loop()'s own comment for
+    // the full rationale (Rob: RS-Bus stopped receiving entirely on
+    // the tmc-baan, mid-session, with no POWER_OFF/ON in between and
+    // the rest of the system — XpressNet — still fully responsive;
+    // only a full command-station reset recovered it, suggesting the
+    // underlying RSbusMaster PIO state machine itself got stuck rather
+    // than anything at our own loop()/EventBus level).
+    uint32_t _lastRxMs      = 0;
+    bool     _powered       = false;
+
+    // Re-initialises the PIO state machine if track power is on and
+    // no genuine RS-Bus poll result has been seen for too long — see
+    // this method's own comment in rs_bus_hal.cpp for the full
+    // rationale.
+    void _checkWatchdog(uint32_t now);
 };
 
 extern RsBusHal gRsBusHal;

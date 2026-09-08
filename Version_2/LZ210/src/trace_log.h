@@ -101,6 +101,8 @@ enum class TraceSource : uint8_t {
     HBRIDGE,
     CDE,
     DCCHAL,
+    RS_BUS,      // RS-Bus feedback HAL
+    WEB,         // Webserver — HTTP requests/responses
     _COUNT       // sentinel — must stay last; used for array sizing/iteration only, never logged under
 };
 

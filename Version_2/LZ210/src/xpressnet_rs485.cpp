@@ -701,9 +701,14 @@ void XpressNetRs485::_onEvent(const Event& ev) {
             self.enqueueBroadcast(pkt, 1 + pairCount * 2 + 1);
         }
     } else if (ev.type == EvType::FEEDBACK) {
-        // Single pair (N=2 → header byte 0x42)
+        // Single pair (N=2 → header byte 0x42). Module address is
+        // 0-based in this protocol byte per XpressNet spec §2.1.11
+        // ("directly the address of the module", range 0..127) — but
+        // ev.fbModule itself is 1-based (see LenzLan::onEvent()'s own
+        // comment on the identical fix there for the full rationale).
+        uint8_t addrByte = (uint8_t)((ev.fbModule - 1) & 0x7F);
         uint8_t itnz = 0x40 | (ev.fbNibble ? 0x10 : 0x00) | (ev.fbDat & 0x0F);
-        uint8_t pkt[] = { 0x42, (uint8_t)ev.fbModule, itnz, (uint8_t)(0x42 ^ ev.fbModule ^ itnz) };
+        uint8_t pkt[] = { 0x42, addrByte, itnz, (uint8_t)(0x42 ^ addrByte ^ itnz) };
         self.enqueueBroadcast(pkt, sizeof(pkt));
     }
 }

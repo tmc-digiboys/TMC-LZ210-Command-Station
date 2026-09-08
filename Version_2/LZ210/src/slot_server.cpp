@@ -10,6 +10,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 #include "slot_server.h"
+#include "loconet_module.h"    // gLocoNet.slotServer() — see the registerHandler() call below
 #include "xpressnet_handler.h"  // for gCentrale.shortCircuit
 #include "trace_log.h"
 #include <Arduino.h>
@@ -28,7 +29,7 @@ SlotServer::SlotServer(LocoNetDispatcher& dispatcher,
                        LocoRepository&    repo,
                        CommandBus&        cmdBus,
                        EventBus&          evtBus)
-    : _repo(repo), _cmdBus(cmdBus), _evtBus(evtBus)
+    : _dispatcher(dispatcher), _repo(repo), _cmdBus(cmdBus), _evtBus(evtBus)
 {
     dispatcher.onPacket(OPC_LOCO_ADR,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleLocoAdr    (dispatcher,p); });
     dispatcher.onPacket(OPC_MOVE_SLOTS,   [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleMoveSlots  (dispatcher,p); });
@@ -45,6 +46,7 @@ SlotServer::SlotServer(LocoNetDispatcher& dispatcher,
     dispatcher.onPacket(OPC_SW_STATE,     [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleSwState    (dispatcher,p); });
     dispatcher.onPacket(OPC_SW_ACK,       [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleSwAck      (dispatcher,p); });
     dispatcher.onPacket(OPC_GPON,         [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleGpOn       (dispatcher,p); });
+    dispatcher.onPacket(OPC_INPUT_REP,    [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleInputRep   (dispatcher,p); });
     // OPC_A3: F9-F12 (Uhlenbrock/Intellibox extension, also used by FRED)
     // NOTE: unlike every other opcode registered above, 0xA3 is NOT part
     // of the Digitrax LocoNet(r) Personal Use Edition 1.0 specification
@@ -56,6 +58,30 @@ SlotServer::SlotServer(LocoNetDispatcher& dispatcher,
     dispatcher.onPacket(0xA3,             [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleLocoF9F12  (dispatcher,p); });
     dispatcher.onPacket(OPC_GPOFF,        [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleGpOff      (dispatcher,p); });
     dispatcher.onPacket(OPC_IDLE,         [this,&dispatcher](const LnMsg* p){ traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "RX", p->data, p->length()); _handleIdle       (dispatcher,p); });
+
+    // EventBus: receives ACCESSORY_STATE events from other protocol
+    // modules (XpressNet, Z21) so a turnout command originating there
+    // is also genuinely transmitted onto the physical LocoNet bus as
+    // an OPC_SW_REQ — see onEvent()'s own comment for the full
+    // rationale (Rob: a genuine LocoNet feedback module's own address-
+    // learning procedure requires seeing this opcode on the bus, which
+    // previously never happened for a turnout driven from XpressNet/
+    // Z21, since that command only ever reached the DCC track output).
+    // The EventBus itself skips a handler whose registered moduleId
+    // matches the event's own sourceId, so this cannot echo back an
+    // ACCESSORY_STATE this same module just published from a genuine,
+    // physical OPC_SW_REQ it received (see _publishAccessoryEvent()).
+    //
+    // Registration itself happens in LocoNetModule::begin(), NOT here
+    // in the constructor — see that method's own comment for why
+    // (confirmed necessary, not just a style choice: registering here
+    // caused the handler to silently never fire at all, tracked down
+    // to this constructor running during global static object
+    // initialisation — for gLocoNet, a global object — before
+    // EventBus::instance()'s own static data is guaranteed to be
+    // ready, a classic "static initialisation order" hazard; every
+    // other module's own registerHandler() call already avoided this
+    // by living in begin(), called explicitly later, from setup()).
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -169,6 +195,40 @@ void SlotServer::_handleLocoAdr(LocoNetDispatcher& dispatcher,
                                  const LnMsg* pkt)
 {
     uint16_t addr = ((uint16_t)pkt->la.adr_hi << 7) | pkt->la.adr_lo;
+
+    // Some throttles use OPC_LOCO_ADR with a specific address as THEIR
+    // OWN way to ask "give me whatever loco is currently dispatched" —
+    // a second, distinct convention from the standard
+    // OPC_MOVE_SLOTS <0> <0> "dispatch get" already handled in
+    // _handleMoveSlots(). Per Digitrax's own official UT1 throttle
+    // manual: "Select address '99' to select a locomotive or consist
+    // that has been DISPATCHED from another Digitrax throttle" — and
+    // notably, that same manual documents the "BT2 Buddy Throttle" as
+    // having "no address selection capability of their own" yet still
+    // able to acquire a dispatched loco this way, matching Rob's own
+    // Fred (Stop/Shift/F0-F8 only, no numeric address entry at all).
+    //
+    // Address 0 is handled the same way — confirmed via Rob's own
+    // TraceLog that his Fred repeatedly sends OPC_LOCO_ADR(0) while
+    // sitting in its own "waiting" state.
+    //
+    // More generally, ANY address above the genuine, practical DCC
+    // range (addr_hi/adr_lo combined never legitimately exceed ~9999
+    // for a real loco) is treated the same way — confirmed necessary
+    // against Rob's own LocoNet monitor: his Fred was also seen
+    // repeatedly requesting "address 32767", which decodes to
+    // adr_hi=0xFF, adr_lo=0x7F — an all-bits-set sentinel value, not a
+    // genuine address, sent the same way address 0 was. Rather than
+    // enumerate every such sentinel value a throttle might use as we
+    // happen to discover them one at a time, anything clearly outside
+    // the real, valid loco-address space is redirected here — this can
+    // only ever help (a genuine loco address is never this large),
+    // never misroute an actually-valid request.
+    if (addr == 0 || addr == 99 || addr > 9999) {
+        _handleDispatchGet(dispatcher);
+        return;
+    }
+
     uint8_t slot = _assignSlot(addr, 0, 0);
     if (slot == LN_NO_SLOT) {
         _sendLack(dispatcher, OPC_LOCO_ADR & 0x7F, 0);
@@ -228,7 +288,14 @@ void SlotServer::_handleMoveSlots(LocoNetDispatcher& dispatcher,
         if (loco) {
             loco->ln.stat           = LN_STAT_IN_USE;
             loco->ln.lastActivityMs = millis();
-            loco->ln.dirty          = true;
+            // Sent directly below, not via the periodic dirty-slot
+            // maintenance — see _handleDispatchGet()'s own comment on
+            // this exact class of bug (a genuine, confirmed cause of
+            // Rob's own Fred seeing duplicate, back-to-back SL_RD_DATA
+            // for a single transition) for the full rationale. Applies
+            // equally to every other branch in this method and to
+            // _handleSlotStat1() — all fixed the same way.
+            loco->ln.dirty          = false;
         }
         _repo.unlock();
         if (loco) _sendSlotData(dispatcher, src);
@@ -244,27 +311,22 @@ void SlotServer::_handleMoveSlots(LocoNetDispatcher& dispatcher,
             loco->ln.stat  = LN_STAT_COMMON;
             loco->ln.id1   = 0;
             loco->ln.id2   = 0;
-            loco->ln.dirty = true;
+            loco->ln.dirty = false;  // see NULL MOVE branch's own comment above
         }
         _repo.unlock();
+        // Record this as the slot a subsequent "dispatch get" should
+        // hand back — see _lastDispatchedSlot's own comment in
+        // slot_server.h for the full rationale.
+        if (loco) _lastDispatchedSlot = src;
         if (loco) _sendSlotData(dispatcher, src);
         else      _sendLack(dispatcher, OPC_MOVE_SLOTS & 0x7F, 0);
         return;
     }
 
-    // DISPATCH GET: src==0, dst==0 → grab the first COMMON slot
+    // DISPATCH GET: src==0, dst==0 → see _handleDispatchGet()'s own
+    // comment (shared with _handleLocoAdr()'s addr==0 case).
     if (src == 0 && dst == 0) {
-        if (!_repo.lockRead(500)) return;
-        uint8_t found = LN_NO_SLOT;
-        for (uint8_t i = 0; i < _repo.count(); i++) {
-            const LocoBase* l = _repo.at(i);
-            if (l && l->active && l->ln.stat == LN_STAT_COMMON) {
-                found = l->ln.slot; break;
-            }
-        }
-        _repo.unlock();
-        if (found != LN_NO_SLOT) _sendSlotData(dispatcher, found);
-        else                      _sendLack(dispatcher, OPC_MOVE_SLOTS & 0x7F, 0);
+        _handleDispatchGet(dispatcher);
         return;
     }
 
@@ -279,13 +341,157 @@ void SlotServer::_handleMoveSlots(LocoNetDispatcher& dispatcher,
         dstL->ln.stat   = srcL->ln.stat;
         dstL->ln.id1    = srcL->ln.id1;
         dstL->ln.id2    = srcL->ln.id2;
-        dstL->ln.dirty  = true;
+        dstL->ln.dirty  = false;  // see NULL MOVE branch's own comment above
         srcL->ln.stat   = LN_STAT_FREE;
         srcL->ln.slot   = LN_NO_SLOT;
-        srcL->ln.dirty  = true;
+        srcL->ln.dirty  = true;  // srcL itself is NOT sent below (only
+                                  // dst is) — this one genuinely does
+                                  // need the periodic maintenance to
+                                  // announce srcL's own new FREE state
     }
     _repo.unlock();
     _sendSlotData(dispatcher, dst);
+}
+
+// _handleDispatchGet() — hands back specifically the loco most
+// recently released via "dispatch put" (see _lastDispatchedSlot's own
+// comment in slot_server.h) — falling back to the first COMMON slot
+// found only if nothing is currently recorded as dispatched (e.g.
+// after a reboot, or if it was already picked up once and this is a
+// genuinely new request with nothing pending), matching prior
+// behaviour for that case. Shared by _handleMoveSlots()'s own
+// OPC_MOVE_SLOTS <0> <0> case and by _handleLocoAdr()'s addr==0 case
+// — see the latter's own comment for why a second call site exists.
+void SlotServer::_handleDispatchGet(LocoNetDispatcher& dispatcher)
+{
+    // Write lock (not read) — see the ln.dirty clear below, which
+    // needs to mutate the found loco under the same lock that found
+    // it.
+    if (!_repo.lockWrite(500)) return;
+    uint8_t found = LN_NO_SLOT;
+    // Accepts IDLE as well as COMMON here — confirmed necessary via
+    // Rob's own, successful reference: dispatchByAddress() now simply
+    // creates the slot via _assignSlot() (which leaves it at
+    // LN_STAT_IDLE, exactly like a genuine throttle's own fresh
+    // OPC_LOCO_ADR request would), rather than also doing an explicit
+    // claim/OPC_SLOT_STAT1/dispatch-put dance to force it to COMMON —
+    // that fuller dance is what an earlier, DR5000+Rocrail capture
+    // showed for a DIFFERENT scenario (Rocrail re-dispatching a loco
+    // it already held its own slot for), but is not the only way to
+    // reach a Fred-acquirable state, and a genuinely fresh IDLE slot
+    // already worked when Rocrail's own native dispatch simply sent a
+    // plain OPC_LOCO_ADR through this same codebase's ordinary
+    // _handleLocoAdr() path.
+    if (_lastDispatchedSlot != LN_NO_SLOT) {
+        LocoBase* l = _repo.findBySlot(_lastDispatchedSlot);
+        if (l && l->active &&
+            (l->ln.stat == LN_STAT_COMMON || l->ln.stat == LN_STAT_IDLE)) {
+            found = _lastDispatchedSlot;
+        }
+    }
+    if (found == LN_NO_SLOT) {
+        for (uint8_t i = 0; i < _repo.count(); i++) {
+            LocoBase* l = const_cast<LocoBase*>(_repo.at(i));
+            if (l && l->active &&
+                (l->ln.stat == LN_STAT_COMMON || l->ln.stat == LN_STAT_IDLE)) {
+                found = l->ln.slot; break;
+            }
+        }
+    }
+    // Clear ln.dirty on the slot we're about to answer directly here —
+    // needed because dispatchByAddress() (the web dispatch action)
+    // sets it, for the benefit of already-connected LocoNet devices
+    // that should learn of a new dispatch via the normal periodic
+    // "resend dirty slots" maintenance in SlotServer::process()
+    // (LocoNetModule::loop()) without needing to ask. But if a
+    // throttle's own explicit dispatch-get request (this method)
+    // arrives before that periodic maintenance has run, the slot is
+    // answered directly here AND is still dirty — so process()'s own
+    // next pass sends the identical SL_RD_DATA a second time shortly
+    // after. Confirmed via Rob's own TraceLog/LocoNet-monitor: exactly
+    // this duplicate (BUSY+SL_RD_DATA sent twice, byte-for-byte
+    // identical, milliseconds apart) for a single genuine dispatch-get
+    // — a real Fred appears not to accept the second, seemingly
+    // spontaneous "the slot changed again" notification, and never
+    // goes on to claim it via a NULL MOVE.
+    if (found != LN_NO_SLOT) {
+        LocoBase* l = const_cast<LocoBase*>(_repo.findBySlot(found));
+        if (l) {
+            l->ln.dirty = false;
+            // Confirmed via Rob's own, direct comparison: the ONE
+            // genuinely successful Fred acquire showed the slot handed
+            // back with status IDLE (0x23) — every attempt that instead
+            // showed COMMON (0x13) at this exact point (e.g. after
+            // Rocrail's own claim/OPC_SLOT_STAT1/dispatch-put dance
+            // left it COMMON rather than a fresh _assignSlot() leaving
+            // it IDLE) failed to get the Fred to follow up with its own
+            // OPC_WR_SL_DATA claim, even after the separate, now-fixed
+            // duplicate-SL_RD_DATA bug was ruled out. Forcing IDLE here
+            // — regardless of whatever status the slot happened to
+            // carry into this handoff — reproduces the one confirmed-
+            // working case unconditionally, rather than depending on
+            // which earlier path (a fresh _handleLocoAdr() vs. a full
+            // Rocrail re-dispatch dance) happened to leave it at.
+            l->ln.stat = LN_STAT_IDLE;
+        }
+    }
+    _repo.unlock();
+    // Once handed back (to anyone, successfully or not — a slot is
+    // only ever dispatched once at a time in this codebase, no queue
+    // of pending dispatches), it is no longer "the pending dispatch"
+    // — the next dispatch get with nothing new put should not keep
+    // re-handing out a stale one indefinitely.
+    if (found == _lastDispatchedSlot) _lastDispatchedSlot = LN_NO_SLOT;
+    traceLog().logf(TraceLevel::DEBUG, TraceSource::LNET,
+                     "DISPATCH GET: handing back slot=%u", found);
+    if (found != LN_NO_SLOT) _sendSlotData(dispatcher, found);
+    else                      _sendLack(dispatcher, OPC_MOVE_SLOTS & 0x7F, 0);
+}
+
+// dispatchByAddress() — see this method's own comment in slot_server.h
+// for the full rationale. Finds or creates a slot for addr via the
+// same _assignSlot() helper OPC_LOCO_ADR itself uses, then — unlike
+// _assignSlot()'s own default of LN_STAT_IDLE ("available to be
+// claimed via a fresh NULL MOVE by whichever throttle asked for this
+// address") — sets it to LN_STAT_COMMON and records it as the pending
+// dispatch, exactly matching what a genuine "dispatch put" from a
+// throttle already does in _handleMoveSlots() above, so the existing
+// "dispatch get" handling there hands it back to whichever device
+// picks it up next, with no further changes needed there.
+// dispatchByAddress() — see this method's own comment in slot_server.h
+// for the full rationale.
+//
+// Confirmed via Rob's own, side-by-side comparison: a genuinely
+// successful Fred acquire happened when Rocrail's own native "Dispatch
+// for locomotive control" action sent a plain OPC_LOCO_ADR(addr) via
+// the LnTcp bridge — which this codebase's own, ordinary
+// _handleLocoAdr() handles no differently than a real throttle asking
+// for a fresh address: _assignSlot() creates the slot and leaves it at
+// LN_STAT_IDLE. The Fred's own later, generic dispatch-get (BA 00 00)
+// picked up exactly that IDLE slot and immediately claimed it itself
+// (a genuine OPC_WR_SL_DATA, with its own throttle ID and direction) —
+// no explicit claim/OPC_SLOT_STAT1/dispatch-put dance was involved at
+// all for this success.
+//
+// This SUPERSEDES this method's own, earlier, much more elaborate
+// version, which tried to replicate a DIFFERENT Rocrail+DR5000
+// reference capture's own claim→COMMON→dispatch-put sequence — that
+// capture's sequence is a genuine, valid way to reach the same result
+// (Rocrail apparently does that dance when RE-dispatching a loco it
+// already held its own slot for), but is NOT the only way, and was
+// unnecessarily complex to replicate faithfully (needing several
+// blocking delays and exact wire-level STAT1 byte encoding) compared
+// to simply doing what a genuine OPC_LOCO_ADR request already does on
+// its own. See _handleDispatchGet()'s own comment for the matching
+// change needed there (its own fallback search must also recognise an
+// IDLE slot as "available to hand out", not only COMMON).
+bool SlotServer::dispatchByAddress(uint16_t addr)
+{
+    uint8_t slot = _assignSlot(addr, 0, 0);
+    if (slot == LN_NO_SLOT) return false;
+
+    _lastDispatchedSlot = slot;
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -347,6 +553,24 @@ void SlotServer::_handleWrSlotData(LocoNetDispatcher& dispatcher,
         }
         loco->ln.id1   = pkt->sd.id1;
         loco->ln.id2   = pkt->sd.id2;
+        // A non-zero throttle ID here is a genuine claim (the standard
+        // LocoNet convention for "I am now controlling this slot") —
+        // confirmed as a real, missing step: this handler previously
+        // stored the ID/speed-mode but never actually transitioned the
+        // slot to LN_STAT_IN_USE, so _handleLocoSpd()/_handleLocoDirf()
+        // (which both require exactly that status before applying
+        // anything to DCC — see their own guard) silently ignored every
+        // subsequent speed/function command from this throttle, even
+        // though it was genuinely visible on the bus. Rob: this showed
+        // up as a Fred's own speed commands doing nothing on the DCC
+        // side after acquiring a web-dispatched loco, "fixed" only by
+        // physically disconnecting/reconnecting the Fred — which
+        // presumably issues its own fresh NULL MOVE, and
+        // _handleMoveSlots()'s own null-move branch DOES correctly set
+        // IN_USE, masking the real gap here.
+        if (pkt->sd.id1 != 0 || pkt->sd.id2 != 0) {
+            loco->ln.stat = LN_STAT_IN_USE;
+        }
         loco->ln.dirty = true;
         _repo.markDirty(loco->address);
     }
@@ -373,8 +597,26 @@ void SlotServer::_handleSlotStat1(LocoNetDispatcher& dispatcher,
     if (!_repo.lockWrite(500)) return;
     LocoBase* loco = _repo.findBySlot(slot);
     if (loco) {
-        loco->ln.stat  = stat & 0x03;
-        loco->ln.dirty = true;
+        // Slot status occupies bits 4-5 of the wire-level STAT1 byte
+        // (0x00/0x10/0x20/0x30 = FREE/COMMON/IDLE/IN_USE — see
+        // _fillSlotMsg()'s own switch-statement building these same
+        // values), NOT bits 0-1. Confirmed as a genuine, pre-existing
+        // bug here once dispatchByAddress() started sending a
+        // correctly wire-encoded OPC_SLOT_STAT1 (0x13 for COMMON, per
+        // Rob's own DR5000 reference) — the old "stat & 0x03" mask
+        // would have read 0x13 as 0x03 (IN_USE), not COMMON. It had
+        // gone unnoticed because nothing before this send a wire-
+        // correct value: an earlier version of dispatchByAddress()
+        // itself sent LN_STAT_COMMON's raw internal enum value (0x01)
+        // directly as the wire byte, which this same "& 0x03" mask
+        // happened to parse back as 0x01 (COMMON) purely by
+        // coincidence.
+        loco->ln.stat  = (stat >> 4) & 0x03;
+        loco->ln.dirty = false;  // sent directly below, not via the
+                                  // periodic dirty-slot maintenance —
+                                  // see _handleMoveSlots()'s NULL MOVE
+                                  // branch's own comment for the full
+                                  // rationale (same bug class)
         if (loco->ln.stat == LN_STAT_FREE) loco->ln.slot = LN_NO_SLOT;
     }
     _repo.unlock();
@@ -537,6 +779,23 @@ void SlotServer::_handleUnlinkSlots(LocoNetDispatcher& dispatcher,
 void SlotServer::_handleSwReq(LocoNetDispatcher& dispatcher,
                                const LnMsg* pkt)
 {
+    // See _lastSentSw1/2's own comment in slot_server.h: this exact
+    // message may simply be our own OPC_SW_REQ echoing back on the
+    // shared LocoNet bus, rather than a genuine, new request from
+    // another device. The bus turnaround is normally fast (well under
+    // 100ms), so a generous 1000ms window still safely distinguishes
+    // "our own echo, arriving late" from "a genuine, later request
+    // that happens to use the same bytes" — a real echo essentially
+    // always arrives long before this expires, while a stale flag
+    // past this point almost certainly means the echo was lost
+    // entirely (e.g. a bus collision), so treating a new arrival as
+    // genuine again after this is the safer default.
+    if (_awaitingOwnSwReqEcho && (millis() - _lastSentSwReqMs) < 1000 &&
+        pkt->srq.sw1 == _lastSentSw1 && pkt->srq.sw2 == _lastSentSw2) {
+        _awaitingOwnSwReqEcho = false;
+        return;
+    }
+
     uint16_t addr  = ((uint16_t)(pkt->srq.sw2 & 0x0F) << 7) |
                       (pkt->srq.sw1 & 0x7F);
     addr++;
@@ -628,6 +887,67 @@ void SlotServer::_handleGpOn(LocoNetDispatcher& dispatcher,
     cmd.sourceId = ModuleId::LOCONET_HAL;
     _cmdBus.dispatch(cmd);
     _publishPowerEvent(true);
+}
+
+// _handleInputRep() — OPC_INPUT_REP: a device on the bus (typically a
+// genuine LocoNet feedback/occupancy module) reports one sensor's
+// current state. See slot_server.h's own comment on _lnSensorState
+// for the full translation rationale (Rob, confirmed) — this decodes
+// the 11-bit sensor address and high/low bit per the LocoNet spec,
+// updates the persistent per-sensor bitmap cache, rebuilds the full
+// 4-bit nibble value from that cache (since a single OPC_INPUT_REP
+// only ever reports one of the 4 bits in a nibble, not all 4 at
+// once), and publishes it as a standard FEEDBACK event — the exact
+// same event RsBusHal already publishes for its own feedback bus, so
+// XpressNet/Z21 clients see this exactly like any other feedback
+// module without needing separate handling on their end.
+void SlotServer::_handleInputRep(LocoNetDispatcher& dispatcher,
+                                  const LnMsg* pkt)
+{
+    uint8_t in1 = pkt->data[1];
+    uint8_t in2 = pkt->data[2];
+    // IN2 bit layout per the LocoNet spec: <0,X,I,L,A10,A9,A8,A7>
+    //   X (bit6) = 1 always (not used further here)
+    //   I (bit5) = 0 for a DS54 "aux" input, 1 for a "switch" input —
+    //              CRITICALLY, the spec's own wording is that this is
+    //              "effectively a least significant adr bit" — i.e.
+    //              part of the ADDRESS itself, not merely a type flag
+    //              to note and discard. JMRI's own LnSensorAddress
+    //              class confirms this exactly: asInt() computes
+    //              high*256 + low*2 + (I bit), matching what's used
+    //              below. An earlier version of this handler ignored
+    //              I entirely when building addr, which collapsed two
+    //              genuinely different sensor addresses (I=0 and I=1,
+    //              sharing the same IN1/A10-A7 bits) onto the same
+    //              computed address — confirmed via Rob's own log: the
+    //              same IN1 byte appeared with all four combinations
+    //              of I and L (0x40/0x50/0x60/0x70), which are two
+    //              independent sensors' LOW/HIGH pairs, not one
+    //              sensor's four states — causing them to overwrite
+    //              each other's bit in the cache and reporting the
+    //              wrong detector's state to XpressNet/Z21 clients.
+    //   L (bit4) = 0 for sensor now 0V (LOW), 1 for sensor >=+6V (HIGH)
+    //   A10-A7 (bits3-0) = 4 high address bits
+    uint8_t  low  = in1 & 0x7F;         // A6-A0
+    uint8_t  high = in2 & 0x0F;         // A10-A7
+    uint8_t  iBit = (in2 >> 5) & 0x01;  // least significant address bit
+    bool     on   = (in2 & 0x10) != 0;  // "L" bit: sensor HIGH (true) or LOW (false)
+    uint16_t addr = ((uint16_t)high * 256) + ((uint16_t)low * 2) + iBit;  // 0-based sensor address
+
+    uint16_t byteIdx = addr / 8;
+    uint8_t  bitIdx  = addr % 8;
+    if (byteIdx >= sizeof(_lnSensorState)) return;  // out of the cache's range
+
+    if (on) _lnSensorState[byteIdx] |=  (1 << bitIdx);
+    else    _lnSensorState[byteIdx] &= ~(1 << bitIdx);
+
+    uint16_t module = (addr / 8) + 1;      // agreed RS-Bus-style translation
+    uint8_t  nibble = (addr % 8) / 4;
+    uint8_t  nibbleVal = nibble ? (_lnSensorState[byteIdx] >> 4)
+                                : (_lnSensorState[byteIdx] & 0x0F);
+
+    Event ev = Ev::feedback(ModuleId::LOCONET_HAL, module, nibble, nibbleVal, false);
+    _evtBus.publish(ev);
 }
 
 // _handleGpOff() — OPC_GPOFF: a device on the bus requests global
@@ -850,25 +1170,57 @@ void SlotServer::_fillSlotMsg(LnMsg& msg, const LocoBase* loco) const
     writeChecksum(msg);
 }
 
+// _fillEmptySlotMsg() — builds a genuine OPC_SL_RD_DATA message
+// reporting slot `slot` as FREE (stat=0x00, no loco assigned) rather
+// than a failure LACK. Per the LocoNet convention, a valid-but-unused
+// slot number should be reported this way — a failure LACK is meant
+// for a genuinely invalid request (e.g. a slot number outside the
+// supported range), not "this slot exists but is currently empty".
+// Needed specifically because JMRI's own startup behaviour queries
+// every slot 1-120 in turn to build its own slot table (confirmed via
+// Rob's own JMRI monitor log) — previously, every one of those queries
+// for a genuinely free slot got a failure LACK instead, which is valid
+// per the spec's own LACK mechanism but produced roughly 119 repeated
+// rejection lines in JMRI's own monitor display for a perfectly normal
+// startup sequence.
+void SlotServer::_fillEmptySlotMsg(LnMsg& msg, uint8_t slot) const
+{
+    msg.sd.command   = OPC_SL_RD_DATA;
+    msg.sd.mesg_size = 14;
+    msg.sd.slot      = slot;
+    msg.sd.stat      = 0x00;  // FREE
+    msg.sd.adr       = 0;
+    msg.sd.adr2      = 0;
+    msg.sd.spd       = 0;
+    msg.sd.trk       = _trkStatus;
+    msg.sd.ss2       = 0x08;  // per DR5000 reference behaviour
+    msg.sd.dirf      = 0;
+    msg.sd.snd       = 0;
+    msg.sd.id1       = 0;
+    msg.sd.id2       = 0;
+    writeChecksum(msg);
+}
+
 // _sendSlotData(slot) — under the repository read lock, looks up the
 // loco assigned to the given slot number. If none is found, replies
-// with a failure LACK for OPC_RQ_SL_DATA instead. Otherwise builds
-// the SL_RD_DATA message via _fillSlotMsg() while still holding the
-// lock, releases the lock, and then queues both an OPC_BUSY message
-// and the SL_RD_DATA message for transmission (see the queuing
-// rationale below).
+// with a genuine SL_RD_DATA reporting that slot as FREE (see
+// _fillEmptySlotMsg()'s own comment for why, rather than a failure
+// LACK). Otherwise builds the SL_RD_DATA message via _fillSlotMsg()
+// while still holding the lock, releases the lock, and then queues
+// both an OPC_BUSY message and the SL_RD_DATA message for
+// transmission (see the queuing rationale below).
 void SlotServer::_sendSlotData(LocoNetDispatcher& dispatcher, uint8_t slot)
 {
     if (!_repo.lockRead(500)) return;
     LocoBase* loco = _repo.findBySlot(slot);
+    LnMsg msg;
     if (!loco) {
         _repo.unlock();
-        _sendLack(dispatcher, OPC_RQ_SL_DATA & 0x7F, 0);
-        return;
+        _fillEmptySlotMsg(msg, slot);
+    } else {
+        _fillSlotMsg(msg, loco);
+        _repo.unlock();
     }
-    LnMsg msg;
-    _fillSlotMsg(msg, loco);
-    _repo.unlock();
     // Queue OPC_BUSY and SL_RD_DATA on the TX queue
     // so they are sent outside the OPC callback
     // (after the CD backoff timeout has elapsed)
@@ -1107,4 +1459,64 @@ void SlotServer::_publishAccessoryEvent(uint16_t addr,
     ev.output   = output ? 1 : 0;
     ev.state    = active;   // Event.state, not Event.active
     _evtBus.publish(ev);
+}
+
+// onEvent() — EventBus handler. Currently only acts on ACCESSORY_STATE
+// (a turnout/accessory command, from whichever protocol module
+// originated it — XpressNet, Z21, etc.). Builds a genuine OPC_SW_REQ
+// and queues it for transmission on the physical LocoNet bus.
+//
+// Rationale (Rob): a genuine LocoNet feedback module's own address-
+// learning procedure (press its button, then send two OPC_SW_REQ
+// commands — one at the module's target address, one at the sensor
+// count — which the module itself listens for on the bus while in
+// that mode) never worked when driving those turnout commands from
+// XpressNet via the LZ210, and worked immediately when using a DR5000
+// instead. Investigating confirmed why: DccHal::setAccessory() only
+// ever drove the DCC track output for a turnout command — it never
+// also put a genuine OPC_SW_REQ onto the physical LocoNet bus, so a
+// LocoNet-native device listening for exactly that opcode (like this
+// module's own learn mode) never saw it, regardless of the turnout
+// itself moving correctly on the rails.
+//
+// The EventBus itself will not deliver this same event back to this
+// handler when SlotServer was the one that originally published it —
+// registerHandler()'s moduleId (LOCONET_HAL) matches
+// _publishAccessoryEvent()'s own sourceId, and publish() skips a
+// handler whose moduleId matches the event's sourceId — so a genuine
+// OPC_SW_REQ arriving from the physical bus (which itself already
+// publishes this same ACCESSORY_STATE event, for XpressNet/Z21 to see)
+// cannot loop back and be re-transmitted here.
+void SlotServer::onEvent(const Event& ev)
+{
+    if (ev.type != EvType::ACCESSORY_STATE) return;
+    if (ev.address == 0) return;
+
+    // ev.address is this codebase's 1-based output-address convention
+    // (see _handleSwReq()'s own "addr++" for the same conversion in
+    // the opposite direction) — the wire value is 0-based.
+    uint16_t addr0based = ev.address - 1;
+    bool     closed     = ev.output != 0;  // RCN-213: 0=thrown,1=straight
+    bool     activate   = ev.state;
+
+    uint8_t sw1 = addr0based & 0x7F;
+    uint8_t sw2 = (uint8_t)((addr0based >> 7) & 0x0F)
+                | (activate ? OPC_SW_REQ_OUT : 0)
+                | (closed   ? OPC_SW_REQ_DIR : 0);
+
+    traceLog().logf(TraceLevel::DEBUG, TraceSource::LNET,
+                     "onEvent: queueing OPC_SW_REQ sw1=0x%02X sw2=0x%02X (addr0based=%u)",
+                     sw1, sw2, addr0based);
+
+    // Record what we're about to send so _handleSwReq() can recognise
+    // this exact message echoing back on the physical bus and skip
+    // re-processing it — see this state's own comment in slot_server.h
+    // for the full rationale (this is what was causing the command to
+    // loop indefinitely before this check existed).
+    _lastSentSw1 = sw1;
+    _lastSentSw2 = sw2;
+    _lastSentSwReqMs = millis();
+    _awaitingOwnSwReqEcho = true;
+
+    _queueMsg(makeMsg(OPC_SW_REQ, sw1, sw2));
 }

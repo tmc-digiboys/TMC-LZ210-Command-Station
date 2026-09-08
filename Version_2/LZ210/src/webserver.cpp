@@ -6,6 +6,7 @@
 #include "rs_bus_hal.h"           // gRsBusHal
 #include "lenz_lan.h"             // gLenzLan
 #include "z21_lan.h"              // gZ21Lan
+#include "ln_tcp.h"                // gLnTcp, LN_TCP_PORT_DEFAULT
 #include "trace_log.h"             // traceLog()
 #include "loco_repository.h"      // locoRepo()
 #include "eeprom_store.h"         // eepromStore()
@@ -80,9 +81,11 @@ void Webserver::loop() {
 void Webserver::_handleClient(EthernetClient& client) {
     HttpRequest req;
     if (!_parseRequest(client, req) || !req.valid) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::WEB, "malformed request, sending 404");
         _handle404(client);
         return;
     }
+    traceLog().logf(TraceLevel::DEBUG, TraceSource::WEB, "%s %s", req.method, req.path);
 
     if (strcmp(req.method, "GET") == 0) {
         if (_pathEquals(req.path, "/style.css")) { _handleCss(client); return; }
@@ -138,7 +141,8 @@ void Webserver::_handleClient(EthernetClient& client) {
                 gAccessories[i].known = false;
                 gAccessories[i].state = 0;
             }
-            eepromStore().saveAccessories();
+            // No longer persisted to flash — see xpressnet_handler.cpp's
+            // own comment on removing saveAccessories() entirely.
             _sendRedirect(client, "/?p=turnouts");
             return;
         }
@@ -150,6 +154,18 @@ void Webserver::_handleClient(EthernetClient& client) {
         if (_pathEquals(req.path, "/clear/feedback")) {
             gRsBusHal.clearAll();
             _sendRedirect(client, "/?p=feedback");
+            return;
+        }
+        if (_pathEquals(req.path, "/loconet/dispatch")) {
+            // Not an EepromStore parameter (a one-off action, not a
+            // persisted setting), so parsed directly here rather than
+            // via _parseFormBody() — same pattern as the "_p=" field
+            // is already parsed out of req.body elsewhere in this file.
+            uint16_t addr = 0;
+            const char* ap = strstr(req.body, "addr=");
+            if (ap) addr = (uint16_t)atoi(ap + 5);
+            if (addr > 0) gLocoNet.slotServer().dispatchByAddress(addr);
+            _sendRedirect(client, "/?p=loconet");
             return;
         }
     }
@@ -238,6 +254,13 @@ bool Webserver::_parseRequest(EthernetClient& client, HttpRequest& req) {
                 req.body[read++] = client.read();
         }
         req.bodyLen = read;
+        // Explicit null terminator — the "contentLength < WEB_MAX_REQ_SIZE"
+        // check above guarantees at least one byte of headroom for it.
+        // Needed for strstr(req.body, ...) (used both here for "_p=" and
+        // by the /loconet/dispatch route for "addr=") to never read past
+        // the genuinely-received data into whatever stack garbage happens
+        // to follow it.
+        req.body[read] = 0;
     }
 
     req.valid = true;
@@ -390,6 +413,7 @@ void Webserver::_buildSidebar(EthernetClient& c, const char* active) {
     _navItem(c, "systeem",  "System",       active);
     _navItem(c, "internet", "Internet",     active);
     _navItem(c, "lenzlan",  "LenzLAN",      active);
+    _navItem(c, "lntcp",    "LocoNet-over-TCP", active);
     _navItem(c, "z21",      "Z21",          active);
     _navItem(c, "webif",    "Web Interface",active);
     _navItem(c, "tracelog", "Debug Log",    active);
@@ -445,6 +469,7 @@ void Webserver::_shellClose(EthernetClient& c) {
 void Webserver::_handleRoot(EthernetClient& c, const char* panel) {
     if (strcmp(panel, "systeem")  == 0) { _panelSysteem(c);   return; }
     if (strcmp(panel, "lenzlan")  == 0) { _panelLenzLan(c);  return; }
+    if (strcmp(panel, "lntcp")    == 0) { _panelLnTcp(c);    return; }
     if (strcmp(panel, "z21")      == 0) { _panelZ21(c);      return; }
     if (strcmp(panel, "webif")    == 0) { _panelWebIf(c);    return; }
     if (strcmp(panel, "tracelog") == 0) { _panelTraceLog(c); return; }
@@ -607,6 +632,37 @@ void Webserver::_panelLenzLan(EthernetClient& c) {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Panel: LocoNet-over-TCP (LnTcp, "LbServer")
+//
+//  Off by default — an optional, independently-switchable protocol
+//  endpoint alongside the physical LocoNet bus (Rob's own request:
+//  "moet een module zijn die uit te schakelen is").
+// ─────────────────────────────────────────────────────────────
+void Webserver::_panelLnTcp(EthernetClient& c) {
+    _shellOpen(c, "lntcp", "LocoNet-over-TCP");
+    c.print(F("<h2>LocoNet-over-TCP</h2>"
+              "<p class='hint'>Supports both known LocoNet-over-TCP "
+              "conventions, auto-detected per connection: raw-binary "
+              "(confirmed via tcpdump: Rocrail's own LnTCP client) and "
+              "the human-readable ASCII \"LbServer\" protocol "
+              "(loconetovertcp.sourceforge.net; confirmed via tcpdump: "
+              "JMRI's own LnTCP client). Every message on the physical "
+              "LocoNet bus is relayed to every connected client "
+              "(formatted for that client's own detected protocol), "
+              "and a client's own message is genuinely transmitted "
+              "onto the physical bus (so real LocoNet devices see it "
+              "too), exactly as if it had arrived from the bus "
+              "itself.</p>"
+              "<form method='POST' action='/config'>"
+              "<input type='hidden' name='_p' value='lntcp'>"));
+    c.print(F("<fieldset><legend>TCP Server</legend>"));
+    _printField(c, "lntcp.enable", "Enabled");
+    _printField(c, "lntcp.port",   "TCP port");
+    c.print(F("</fieldset><button class='btn'>Save</button></form>"));
+    _shellClose(c);
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Panel: Z21
 // ─────────────────────────────────────────────────────────────
 void Webserver::_panelZ21(EthernetClient& c) {
@@ -623,6 +679,30 @@ void Webserver::_panelZ21(EthernetClient& c) {
               "matches that (60s).</p>"));
     _printField(c, "z21.client_timeout_s", "Client inactivity timeout (seconds)");
     c.print(F("</fieldset><button class='btn'>Save</button></form>"));
+
+    // Status: which clients are currently registered as active — Rob
+    // wanted to identify a stale/unexpected registration (e.g. an
+    // earlier test session's client that hasn't yet timed out) rather
+    // than guessing from memory which device a given broadcast is
+    // actually reaching.
+    c.print(F("<fieldset><legend>Active Clients</legend><table>"
+              "<tr><th>IP</th><th>Port</th><th>Last seen</th></tr>"));
+    uint32_t now = millis();
+    bool any = false;
+    for (uint8_t i = 0; i < Z21_MAX_CLIENTS; i++) {
+        const Z21Client& cl = gZ21Lan.clientAt(i);
+        if (!cl.active) continue;
+        any = true;
+        c.print(F("<tr><td>"));
+        c.print(cl.ip);
+        c.print(F("</td><td>"));
+        c.print(cl.port);
+        c.print(F("</td><td>"));
+        c.print((now - cl.lastSeenMs) / 1000);
+        c.print(F("s ago</td></tr>"));
+    }
+    if (!any) c.print(F("<tr><td colspan='3'>None</td></tr>"));
+    c.print(F("</table></fieldset>"));
     _shellClose(c);
 }
 
@@ -815,6 +895,15 @@ void Webserver::_panelRsBus(EthernetClient& c) {
               "this only once all feedback decoders on the layout have been "
               "replaced with newer, self-filtering ones.</p>"));
     _printField(c, "rsbus.delta_filter", "Filter unchanged feedback");
+    c.print(F("</fieldset>"
+              "<fieldset><legend>Watchdog</legend>"
+              "<p class='hint'>If no genuine RS-Bus poll result is seen for "
+              "this long while track power is on, the PIO receiver is "
+              "automatically re-initialised. Confirmed useful when the "
+              "underlying RS-Bus receiver can get stuck (e.g. from noise "
+              "on the physical bus), which previously required a full "
+              "command-station reset to recover from. Set to 0 to disable.</p>"));
+    _printField(c, "rsbus.watchdog_s", "Watchdog timeout (seconds)");
     c.print(F("</fieldset><button class='btn'>Save</button></form>"));
     _shellClose(c);
 }
@@ -944,6 +1033,28 @@ void Webserver::_panelLoconet(EthernetClient& c) {
         locoRepo().unlock();
     }
     c.print(F("</table>"));
+
+    // Dispatch — puts a loco address into the same "released, ready
+    // to be picked up" state a genuine LocoNet dispatch (from an
+    // existing throttle's own release button) would, without needing
+    // any throttle to already hold that slot. Added specifically for
+    // a Fred with no numeric keypad at all (only Stop/Shift/F0-F8),
+    // which cannot itself select an address to dispatch, but can
+    // still pick up whatever is already pending via its own, simple
+    // acquire-dispatched-slot mechanism — see
+    // SlotServer::dispatchByAddress()'s own comment for the full
+    // rationale.
+    c.print(F("<fieldset><legend>Dispatch</legend>"
+              "<p class='hint'>Puts a loco address into the dispatch-"
+              "pending state, ready to be picked up by any LocoNet "
+              "throttle's own acquire-dispatched-slot action — no "
+              "throttle needs to already hold this address first.</p>"
+              "<form method='POST' action='/loconet/dispatch'>"
+              "<label>Loco address</label>"
+              "<input type='text' name='addr' maxlength='5'>"
+              "<button class='btn'>Dispatch</button>"
+              "</form></fieldset>"));
+
     _shellClose(c);
 }
 
@@ -1099,6 +1210,7 @@ void Webserver::_sendHeader(EthernetClient& c, uint16_t code,
 // the client at `location`, used for the redirect-after-POST pattern
 // this server relies on for form submissions.
 void Webserver::_sendRedirect(EthernetClient& c, const char* location) {
+    traceLog().logf(TraceLevel::DEBUG, TraceSource::WEB, "302 -> %s", location);
     c.print(F("HTTP/1.1 302 Found\r\nLocation: "));
     c.print(location);
     c.print(F("\r\nConnection: close\r\n\r\n"));
@@ -1231,8 +1343,12 @@ void Webserver::_parseFormBody(const char* body, uint16_t len) {
 //  is missing or unreasonably long.
 // ─────────────────────────────────────────────────────────────
 void Webserver::_handleConfigPost(EthernetClient& c, const HttpRequest& req) {
+    traceLog().logf(TraceLevel::INFO, TraceSource::WEB, "config POST, bodyLen=%u", req.bodyLen);
     _parseFormBody(req.body, req.bodyLen);
+    uint32_t commitStartMs = millis();
     eepromStore().commit();
+    traceLog().logf(TraceLevel::INFO, TraceSource::WEB, "commit() took %lu ms",
+                     (unsigned long)(millis() - commitStartMs));
     // Redirect back to the panel via the _p hidden field
     char dest[48] = "/?p=internet";
     const char* pp = strstr(req.body, "_p=");

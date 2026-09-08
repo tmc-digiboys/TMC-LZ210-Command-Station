@@ -143,6 +143,7 @@ private:
     void _panelSysteem  (EthernetClient& c);  // System: CDE short-circuit response etc.
     void _panelInternet (EthernetClient& c);  // Network: IP, MAC, hostname, DHCP
     void _panelLenzLan  (EthernetClient& c);  // LenzLAN: port, timeout
+    void _panelLnTcp    (EthernetClient& c);  // LocoNet-over-TCP: enable, port
     void _panelZ21      (EthernetClient& c);  // Z21 LAN: settings
     void _panelWebIf    (EthernetClient& c);  // Web interface: port, auth
     void _panelTraceLog (EthernetClient& c);  // Debug log: TCP stream enable/port, live status

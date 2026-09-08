@@ -29,6 +29,8 @@ const char* traceSourceTag(TraceSource src) {
         case TraceSource::HBRIDGE:  return "HBridge";
         case TraceSource::CDE:      return "CDE";
         case TraceSource::DCCHAL:   return "DccHal";
+        case TraceSource::RS_BUS:   return "RS-Bus";
+        case TraceSource::WEB:      return "Web";
         case TraceSource::_COUNT:   break;  // sentinel, never logged under
     }
     return "?";
@@ -46,6 +48,8 @@ const char* traceSourceEepromKey(TraceSource src) {
         case TraceSource::HBRIDGE:  return "debug.log_src_hbridge";
         case TraceSource::CDE:      return "debug.log_src_cde";
         case TraceSource::DCCHAL:   return "debug.log_src_dcchal";
+        case TraceSource::RS_BUS:   return "debug.log_src_rsbus";
+        case TraceSource::WEB:      return "debug.log_src_web";
         case TraceSource::_COUNT:   break;
     }
     return "debug.log_src_unknown";
@@ -63,6 +67,8 @@ const char* traceSourceLabel(TraceSource src) {
         case TraceSource::HBRIDGE:  return "H-bridge faults";
         case TraceSource::CDE:      return "CDE booster";
         case TraceSource::DCCHAL:   return "DccHal commands";
+        case TraceSource::RS_BUS:   return "RS-Bus feedback";
+        case TraceSource::WEB:      return "Web interface (HTTP)";
         case TraceSource::_COUNT:   break;
     }
     return "Unknown";
@@ -133,14 +139,39 @@ void TraceLog::loop() {
 //  anyone happens to be watching right now.
 // ─────────────────────────────────────────────────────────────
 bool TraceLog::_passesFilter(TraceLevel level, TraceSource source) {
-    // Default minimum level is DEBUG (show everything) — deliberately
-    // NOT INFO, so this filtering feature is purely additive: existing
-    // behaviour (see everything once logging is enabled) is preserved
-    // until the level is actively raised via the web interface, rather
-    // than this addition silently hiding anything by default.
-    uint8_t minLevel = eepromStore().getUint8("debug.tcp_log_level", (uint8_t)TraceLevel::DEBUG);
+    // Index caching: EepromStore::_indexOf() is a linear search over
+    // every registered parameter (~59 by this point in the project,
+    // and growing) — fine for the occasional config-page read, but
+    // this function runs on EVERY logf()/logBytes() call, including
+    // the high-frequency ones covering routine protocol traffic
+    // (LNET RX/TX, TCP RX/TX, ...). A running loco's steady stream of
+    // LocoNet messages made this add up enough to measurably delay
+    // core1's loop() cycle — including the web interface's own
+    // request handling, which shares that same core1 loop() (Rob:
+    // saving a setting became sluggish specifically while LocoNet
+    // traffic was active). Each key's index is looked up once (lazily,
+    // on first use) and cached here — a parameter's index never
+    // changes after boot, since register*() calls only ever append to
+    // the table (never reorder or remove), so this cache stays valid
+    // for the entire session.
+
+    static int8_t levelIdx = -2;   // -2 = not yet looked up, -1 = key not found, >=0 = cached index
+    static int8_t sourceIdx[(uint8_t)TraceSource::_COUNT];
+    static bool   sourceIdxInit = false;
+    if (!sourceIdxInit) {
+        for (uint8_t i = 0; i < (uint8_t)TraceSource::_COUNT; i++) sourceIdx[i] = -2;
+        sourceIdxInit = true;
+    }
+
+    if (levelIdx == -2) levelIdx = eepromStore()._indexOf("debug.tcp_log_level");
+    uint8_t minLevel = (uint8_t)TraceLevel::DEBUG;
+    if (levelIdx >= 0) minLevel = eepromStore()._params[levelIdx].value.u8;
     if ((uint8_t)level < minLevel) return false;
-    return eepromStore().getBool(traceSourceEepromKey(source), true);
+
+    uint8_t si = (uint8_t)source;
+    if (sourceIdx[si] == -2) sourceIdx[si] = eepromStore()._indexOf(traceSourceEepromKey(source));
+    if (sourceIdx[si] < 0) return true;  // key not registered — default true, matching getBool()'s own default
+    return eepromStore()._params[sourceIdx[si]].value.b;
 }
 
 // ─────────────────────────────────────────────────────────────

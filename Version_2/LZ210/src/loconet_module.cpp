@@ -33,7 +33,7 @@ LocoNetModule  gLocoNet;
 //  Stores the instance pointer for use in the static _cmdHandler.
 // ─────────────────────────────────────────────────────────────
 LocoNetModule::LocoNetModule()
-    : HardwareModule("LocoNet", ModuleId::LOCONET_HAL, ModuleCore::CORE0)
+    : HardwareModule("LocoNet", ModuleId::LOCONET_HAL, ModuleCore::CORE1)
     , _lnBus()
     , _dispatcher(&_lnBus)
     , _phy(&Serial1, LN_RX_PIN, LN_TX_PIN, &_lnBus, false, true)
@@ -65,6 +65,41 @@ void LocoNetModule::begin()
     // Register as CommandBus handler so loco updates from LenzLAN/Z21
     // appear as SL_RD_DATA broadcasts on the LocoNet bus
     CommandBus::instance().registerHandler(ModuleId::LOCONET_HAL, _cmdHandler);
+
+    // EventBus: receives ACCESSORY_STATE events from other protocol
+    // modules (XpressNet, Z21) so a turnout command originating there
+    // is also genuinely transmitted onto the physical LocoNet bus as
+    // an OPC_SW_REQ — see SlotServer::onEvent()'s own comment for the
+    // full rationale (Rob: a genuine LocoNet feedback module's own
+    // address-learning procedure requires seeing this opcode on the
+    // bus, which previously never happened for a turnout driven from
+    // XpressNet/Z21, since that command only ever reached the DCC
+    // track output).
+    //
+    // Deliberately registered HERE, in begin() — called explicitly
+    // from setup1()/beginCore1(), same as every other module's own
+    // registerHandler() call — and NOT in SlotServer's own
+    // constructor, where it was first placed and confirmed (Rob's own
+    // TraceLog: the "publishing ACCESSORY_STATE" line appeared, the
+    // corresponding "onEvent: ACCESSORY_STATE received" line never
+    // did) to silently never fire. SlotServer's constructor runs as
+    // part of constructing gLocoNet, a global object — i.e. during
+    // global static initialisation, before setup()/setup1() run at
+    // all — at which point EventBus::instance()'s own static data is
+    // not guaranteed to be ready yet (a classic "static initialisation
+    // order" hazard across translation units). Every other module's
+    // own registerHandler() call already lived in begin() already, for
+    // exactly this reason.
+    //
+    // EvHandler is a plain C function pointer (no captures allowed),
+    // unlike other modules' own registerHandler() calls which use a
+    // capture-less lambda referring to their own global singleton
+    // (e.g. LenzLan's own "gLenzLan.onEvent(ev)") — SlotServer itself
+    // has no such global (it's reached via gLocoNet.slotServer()), so
+    // the same capture-less pattern is used here instead of capturing
+    // `this`.
+    EventBus::instance().registerHandler(ModuleId::LOCONET_HAL,
+        [](const Event& ev){ gLocoNet.slotServer().onEvent(ev); });
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -42,6 +42,26 @@ public:
     // translation into LocoNet OPC messages).
     void onCommand(const Command& cmd) override;
 
+    // Read-only access to the shared LocoNetBus (Bus<LnMsg, LN_STATUS,
+    // LN_STATUS::LN_IDLE, 10> — see Bus.h) — needed by LnTcp to
+    // register itself as an additional LocoNetConsumer (addConsumer())
+    // and to inject externally-received (TCP SEND) messages onto the
+    // bus (broadcast()), exactly like any other message source (the
+    // physical PHY, or SlotServer's own dispatcher) already does. This
+    // is the library's own, documented mechanism for letting several
+    // LocoNet message sources co-exist (physical bus, USB-serial,
+    // LbServer/TCP) and exchange messages with each other — see Bus.h's
+    // own header comment.
+    LocoNetBus& bus() { return _lnBus; }
+
+    // Read-only access to the owned SlotServer instance — needed so a
+    // capture-less (plain-function-pointer-compatible) lambda can
+    // reach it when registering SlotServer::onEvent() with the
+    // EventBus, since EvHandler is a plain C function pointer (no
+    // captures allowed) — see slot_server.cpp's own registration
+    // comment for the full rationale.
+    SlotServer& slotServer() { return _slotServer; }
+
 private:
     // Member construction order is critical — do not reorder:
     LocoNetBus           _lnBus;       // 1. Bus arbiter (must be first)

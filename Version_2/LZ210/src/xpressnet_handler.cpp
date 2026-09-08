@@ -1098,8 +1098,17 @@ XNHandleResult XpressNetHandler::handleTurnout(const uint8_t* in, uint8_t il,
         _broadcastFn(bc, 4, 0);
     }
 
-    // Persist the turnout state to EEPROM on activate (d1=1)
-    if (d1) eepromStore().saveAccessories();
+    // gAccessories[] is an in-memory-only active table now (Rob: no
+    // automatic broadcast of turnout state exists anyway — a client
+    // must already query it explicitly — so persisting it to flash
+    // added a real, demonstrated risk (a flash write here, on the
+    // RP2350's shared multicore lockout, appears to have been able to
+    // wedge both cores simultaneously on the tmc-baan, confirmed via
+    // TraceLog — with no recovery possible short of a full reset)
+    // for essentially no benefit: after a reboot, gAccessories[]
+    // simply starts as "unknown" again, exactly like locoRepo() and
+    // RsBusHal's own feedback state already do, and is the client's
+    // own responsibility to (re)establish, same as those.
 
     if (!dispatched) { l = buildError(r, 0x1F); return XNHandleResult::REPLY; }
     l = buildOk(r); return XNHandleResult::OK_SILENT;

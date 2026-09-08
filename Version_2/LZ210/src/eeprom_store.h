@@ -136,7 +136,15 @@ public:
     bool load();                // load from flash (called by begin())
     bool hasChanges() const { return _dirty; }
 
-    // Persistent turnout states (separate file, max 1KB)
+    // Persistent turnout states (separate file, max 1KB) — NO LONGER
+    // CALLED anywhere (Rob: a flash write here, via the RP2350's
+    // shared multicore lockout, appears to have been able to wedge
+    // both cores simultaneously — confirmed on the tmc-baan via
+    // TraceLog). gAccessories[] is in-memory-only now, same as
+    // locoRepo() and RsBusHal's own feedback state. Left in place
+    // (unused) rather than removed, in case persisting turnout state
+    // is deliberately wanted again in the future with a properly
+    // debounced/rate-limited write instead of one per command.
     bool saveAccessories();     // write gAccessories[] to flash
     bool loadAccessories();     // load gAccessories[] from flash on startup
     void resetToDefaults();     // restore all values to defaults
@@ -149,6 +157,13 @@ public:
     const ParamDef*  findParam(const char* key) const;
 
 private:
+    // _indexOf() is intentionally public (see below) — TraceLog caches
+    // the index it returns for its own frequently-checked keys (level,
+    // per-source enable flags) rather than re-running this linear
+    // search on every single logf()/logBytes() call, which measurably
+    // added up during heavy LocoNet traffic (Rob: a running loco's
+    // steady stream of messages made web interface saves sluggish,
+    // since both share core1's loop() time).
 public:
     EepromStore() : ModuleBase("EepromStore", ModuleId::EEPROM_STORE,
                                 ModuleCore::BOTH) {}

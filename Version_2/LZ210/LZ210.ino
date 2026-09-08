@@ -34,6 +34,7 @@
 #include "src/hardware_config.h"
 #include "src/module_registry.h"
 #include "src/loconet_module.h"
+#include "src/ln_tcp.h"
 #include "src/command_bus.h"
 #include "src/event_bus.h"
 #include "src/loco_repository.h"
@@ -66,6 +67,19 @@ static IPAddress staticIp(192, 168, 54, 200);
 // races ahead of core0's own initialisation (e.g. never tries to use
 // EepromStore/LocoRepository/CommandBus before core0 has brought them up).
 volatile bool gCore0Ready      = false;
+
+// gCore1LastAliveMs — updated with millis() at the top of every loop1()
+// (core1) iteration; read by loop() (core0) before deciding whether to
+// feed the hardware watchdog. The watchdog_update()/watchdog_enable()
+// mechanism itself only guards against core0 hanging — it is fed
+// exclusively from loop() — so a core1-only hang (confirmed possible:
+// Rob, tmc-baan, TraceLog showed every core1 module — XN-LAN, LocoNet,
+// RS-Bus — going silent for minutes with no automatic recovery, core0
+// apparently still running since no reset occurred) previously went
+// completely undetected. Rob: "er mag niet een core hangen en de rest
+// loopt door" — a hang in EITHER core must trigger a reset, not just a
+// core0 hang. See loop()'s own comment for how this value is used.
+volatile uint32_t gCore1LastAliveMs = 0;
 
 // gEthernetUsesDhcp — set true in setup1() only if Ethernet.begin()
 // with DHCP actually succeeded. Read by ModuleRegistry::loopCore1()
@@ -146,7 +160,7 @@ volatile bool gSerial2Ready = false;
 void setup() {
     Serial2.begin(115200);
     gSerial2Ready = true;
-    traceSerial.printf("LZ210 v%s boot (hw rev %d)\n",
+    traceSerial.printf("LZ210 v%s boot (hw rev %d)\r\n",
                         LZ210_FW_VERSION_STR, LZ210_HW_REVISION);
 // GPIO pins  available on extended connector used for debux
 pinMode(HW_EXT_GPIO_4, OUTPUT);
@@ -176,11 +190,17 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     #ifdef FACTORY_RESET
     EepromStore::instance().clearStorage();   // delete the stored config file
     EepromStore::instance().resetToDefaults(); // reset _params back to their defaults
-    traceSerial.println("*** FACTORY RESET uitgevoerd — default IP 192.168.54.200 ***");
+    traceSerial.println("*** FACTORY RESET uitgevoerd — default IP 192.168.54.200 ***\r\n");
     #endif
 
-    // Load persisted turnout states from flash
-    EepromStore::instance().loadAccessories();
+    // Turnout state (gAccessories[]) is in-memory only now — no
+    // longer loaded from flash. See xpressnet_handler.cpp's own
+    // comment on removing saveAccessories() for the full rationale
+    // (a flash write there, on the RP2350's shared multicore lockout,
+    // appears to have been able to wedge both cores simultaneously —
+    // confirmed on the tmc-baan via TraceLog). Every entry starts as
+    // "unknown" after a reboot, same as locoRepo() and RsBusHal's own
+    // feedback state already do.
 
     // ── OLED first — show the splash screen before module registration ──
     gOled.begin();
@@ -213,11 +233,13 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     bool r6 = registry().add(&gXpressNetRs485);
     bool r7 = registry().add(&gWebserver);
     bool r8 = registry().add(&gLocoNet);
+    bool r9 = registry().add(&gLnTcp);
     gOled.showStatus("XpressNet", r6);
     gOled.showStatus("Webserver", r7);
     gOled.showStatus("LocoNet",   r8);
+    gOled.showStatus("LnTcp",     r9);
 
-    traceSerial.printf("add: oled=%d eep=%d dcc=%d rsbus=%d xn=%d web=%d ln=%d\n",
+    traceSerial.printf("add: oled=%d eep=%d dcc=%d rsbus=%d xn=%d web=%d ln=%d\r\n",
                    r0, r1, r2, r2b, r6, r7,r8);
 
     delay(1500);  // leave the status screen readable for a moment
@@ -231,7 +253,7 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     gOled.clear();
     gOled.showPower(false);
 
-    traceSerial.println("Core0 klaar");
+    traceSerial.println("Core0 klaar\r\n");
     __dmb();
 
     gCentrale.trackPowerOff = true;   // start with track power off
@@ -252,7 +274,17 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     gCore0Ready = true;
     __dmb();
 
-    // Periodic watchdog — resets the command station if core0 hangs (8 second timeout)
+    // Periodic watchdog — resets the command station if EITHER core
+    // hangs (8 second timeout) — see loop()'s own comment on the
+    // conditional watchdog_update() call for the full mechanism.
+    // Initialised here (not left at its 0 default) because setup1()
+    // busy-waits on gCore0Ready before running at all — core1 cannot
+    // have updated gCore1LastAliveMs yet at this point, however long
+    // setup() itself took to reach here, so this gives core1 the full,
+    // genuine 4-second margin (see loop()) to complete its own setup1()
+    // and reach its first loop1() iteration, rather than that delay
+    // being counted against it from a stale 0.
+    gCore1LastAliveMs = millis();
     watchdog_enable(8000, true);
 }
 
@@ -270,8 +302,10 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
 //     therefore fire and perform an actual hardware reset shortly
 //     after this point, which is the intended mechanism for a clean,
 //     full restart triggered from a client command.
-//  2. Otherwise, feeds the watchdog (watchdog_update()) so the RP2350
-//     does not reset itself under normal operation.
+//  2. Otherwise, feeds the watchdog (watchdog_update()) — but ONLY if
+//     core1 has also shown genuine progress recently, so a hang in
+//     EITHER core (not just core0) leads to a reset — see the call
+//     site's own comment for the full mechanism.
 //  3. Advances the LED status controller's own time-based blink/pulse
 //     state machine.
 //  4. Drains the CommandBus ring buffer, delivering any commands that
@@ -288,11 +322,24 @@ void loop() {
     if (gResetRequested) {
         // Stop feeding the watchdog — it will trigger a reset after 8 seconds
         // (or sooner if watchdog_enable was called elsewhere with a shorter timeout)
-        traceSerial.println("RESET: wordt uitgevoerd...");
+        traceSerial.println("RESET: wordt uitgevoerd...\r\n");
         Serial2.flush();
         while(true) tight_loop_contents();
     }
-    watchdog_update();  // prevent a watchdog reset
+    // Feed the hardware watchdog only if core1 has ALSO shown genuine
+    // progress recently — a hang in either core must lead to a reset,
+    // not just a core0 hang (Rob: "er mag niet een core hangen en de
+    // rest loopt door"). 4000ms is comfortably inside the 8-second
+    // watchdog_enable() timeout, giving core1 several of its own
+    // typical loop1() iterations of margin before this would ever
+    // withhold feeding under genuinely normal operation. Relies on
+    // gCore1LastAliveMs already being seeded with millis() in setup()
+    // (not left at its 0 default) right before watchdog_enable() was
+    // called — see that assignment's own comment for why that matters
+    // here.
+    if (millis() - gCore1LastAliveMs < 4000) {
+        watchdog_update();  // prevent a watchdog reset
+    }
     gLeds.loop();
     // NOTE: CommandBus::instance().poll() is called inside
     // registry().loopCore0() — do NOT also call it here. Calling poll()
@@ -368,7 +415,7 @@ void loop() {
 // ─────────────────────────────────────────────────────────────
 void setup1() {
     while (!gSerial2Ready) tight_loop_contents();
-    traceSerial.println("setup1 gestart");
+    traceSerial.println("setup1 gestart\r\n");
     while (!gCore0Ready) delay(10);
 
     Ethernet.init(HW_ETH_CS_PIN);
@@ -381,7 +428,7 @@ void setup1() {
     gateway.fromString(eepromStore().getString("net.gateway", "192.168.54.1"));
     subnet.fromString (eepromStore().getString("net.subnet",  "255.255.255.0"));
 
-    traceSerial.print("Ethernet initialiseren... ");
+    traceSerial.print("Ethernet initialiseren... \r\n");
     if (useDhcp) {
         traceSerial.print("DHCP... ");
         if (Ethernet.begin(storedMac, 8000, 4000) == 0) {
@@ -404,16 +451,16 @@ void setup1() {
         if (hostname == nullptr || strlen(hostname) == 0) hostname = "tmc-centrale";
         EthernetBonjour.begin(hostname);
         EthernetBonjour.addServiceRecord("TMC Centrale._z21", 21105, MDNSServiceUDP);
-        traceSerial.print("mDNS: "); traceSerial.print(hostname); traceSerial.println(".local");
+        traceSerial.print("mDNS: "); traceSerial.print(hostname); traceSerial.println(".local \r\n");
     } else {
-        traceSerial.println("mDNS: geen geldig IP, overgeslagen");
+        traceSerial.println("mDNS: geen geldig IP, overgeslagen\r\n");
     }
 
     // Wait until the W5500 SPI bus is fully released before initialising PIO2
     delay(500);
     // Start handhelds and XpressNet AFTER ethernet — the DHCP timeout is now short enough
     registry().beginCore1();
-    traceSerial.println("setup1: Core1 klaar");
+    traceSerial.println("setup1: Core1 klaar\r\n");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -440,6 +487,14 @@ void loop1() {
     EventBus::instance().poll();  // process core0 → core1 events
     EthernetBonjour.run();
     registry().loopCore1();
+
+    // Updated only once the whole iteration above has genuinely
+    // completed — not at the top of loop1() — so a hang inside any of
+    // these calls is also detected (the timestamp then simply stops
+    // advancing), not just a hang in loop1() being called at all. See
+    // gCore1LastAliveMs's own declaration for the full rationale.
+    gCore1LastAliveMs = millis();
+    __dmb();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -601,8 +656,22 @@ void _registerDefaultParams() {
     // Configurable via the web interface's RS-Bus panel — see
     // RsBusHal::loop().
     store.registerBool  ("rsbus.delta_filter", true, ModuleId::RS_BUS_HAL);
+    // Watchdog: re-initialises the RS-Bus PIO receiver if no genuine
+    // poll result has been seen for this long while track power is on
+    // — 0 disables it entirely. Configurable via the web interface's
+    // RS-Bus panel — see RsBusHal::_checkWatchdog(). This registration
+    // was originally missing (Rob: the web field showed only its own
+    // label/hint text, no actual input — _printField() silently
+    // renders nothing for a key findParam() doesn't know about).
+    store.registerUint16("rsbus.watchdog_s", 15, ModuleId::RS_BUS_HAL);
     store.registerBool  ("web.enable",   true,  ModuleId::WEBSERVER);
     store.registerUint16("web.port",     80,    ModuleId::WEBSERVER);
+    // LnTcp (LocoNet-over-TCP / "LbServer") — off by default, matching
+    // this project's convention for optional protocol endpoints (see
+    // ln_tcp.h for the full design). Rob's own suggestion, requested
+    // to be independently switchable from LocoNet's physical bus.
+    store.registerBool  ("lntcp.enable", false, ModuleId::LN_TCP);
+    store.registerUint16("lntcp.port",   LN_TCP_PORT_DEFAULT, ModuleId::LN_TCP);
     // TraceLog — off by default (a debug facility, not a normal
     // protocol server). See trace_log.h for the full design.
     store.registerBool  ("debug.tcp_log_enable", false, ModuleId::TRACE_LOG);

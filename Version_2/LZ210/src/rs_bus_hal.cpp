@@ -82,11 +82,13 @@ void RsBusHal::begin() {
     EventBus::instance().registerHandler(ModuleId::RS_BUS_HAL,
         [](const Event& ev){ gRsBusHal.onEvent(ev); });
 
-    traceSerial.println("RsBusHal: RS-Bus geinitialiseerd (gestopt, wacht op power-on)");
-    traceSerial.printf("RsBusHal: TX=GP%d RX=GP%d PIO=%s\n",
-                   RS_BUS_TX_PIN, RS_BUS_RX_PIN,
-                   (RS_BUS_PIO == pio0) ? "pio0" :
-                   (RS_BUS_PIO == pio1) ? "pio1" : "pio2");
+    traceLog().logf(TraceLevel::INFO, TraceSource::RS_BUS,
+                     "RS-Bus geinitialiseerd (gestopt, wacht op power-on)");
+    traceLog().logf(TraceLevel::INFO, TraceSource::RS_BUS,
+                     "TX=GP%d RX=GP%d PIO=%s",
+                     RS_BUS_TX_PIN, RS_BUS_RX_PIN,
+                     (RS_BUS_PIO == pio0) ? "pio0" :
+                     (RS_BUS_PIO == pio1) ? "pio1" : "pio2");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -105,8 +107,10 @@ void RsBusHal::begin() {
 // ─────────────────────────────────────────────────────────────
 void RsBusHal::onEvent(const Event& ev) {
     if (ev.type == EvType::POWER_ON) {
-        traceSerial.println("RsBusHal: power-on → RS-Bus start");
+        traceLog().logf(TraceLevel::INFO, TraceSource::RS_BUS, "power-on -> RS-Bus start");
         rsBus.start();
+        _powered  = true;
+        _lastRxMs = millis();  // start the watchdog window fresh from here
 
         // IMPORTANT: do NOT reset rsBus.fbState[] here. RS-Bus feedback
         // decoders are not tied to DCC track power (own supply, or
@@ -128,8 +132,9 @@ void RsBusHal::onEvent(const Event& ev) {
         // announcing naturally, as each module actually reports in.
         memset(_lastSent, 0xFF, sizeof(_lastSent));
     } else if (ev.type == EvType::POWER_OFF) {
-        traceSerial.println("RsBusHal: power-off → RS-Bus stop");
+        traceLog().logf(TraceLevel::INFO, TraceSource::RS_BUS, "power-off -> RS-Bus stop");
         rsBus.stop();
+        _powered = false;
     }
 }
 
@@ -180,6 +185,9 @@ void RsBusHal::loop() {
     bool deltaFilter = eepromStore().getBool("rsbus.delta_filter", true);
 
     if (rsBus.getRsFeedbacks(message, length)) {
+        _lastRxMs = now;  // any genuine poll result counts as "still alive",
+                           // even a report that turns out unchanged — see the
+                           // watchdog check below for why this matters
         for (uint8_t i = 0; i < length; i++) {
             uint8_t address = message[i * 2];      // RsEntry.address: pure address, 1-128
             uint8_t data     = message[i * 2 + 1];  // RsEntry.data: [6]=nibble,[5:4]=type,[3:0]=value
@@ -206,6 +214,22 @@ void RsBusHal::loop() {
             // which the library already tracks itself — no own _seen[] needed anymore.
 
             bool changed = (_lastSent[address][nibble] != nibData);
+
+            // Logged for EVERY report seen, changed or not, and tagged
+            // with which outcome applies — needed to diagnose exactly
+            // the kind of problem Rob hit on the tmc-baan: "too many
+            // detectors" (a module reporting bogus/noisy data — visible
+            // here as rapid changed=true churn for one address) versus
+            // "no changes coming through" (reports arrive here but
+            // never end up in a published BC, e.g. because deltaFilter
+            // masks them, or none arrive here at all — distinguishing
+            // those two failure modes from a bare "not working" report
+            // needs exactly this per-report visibility).
+            traceLog().logf(TraceLevel::DEBUG, TraceSource::RS_BUS,
+                             "RX addr=%u nibble=%u type=%u dat=0x%X changed=%d filtered=%d",
+                             address, nibble, type, nibData, changed,
+                             deltaFilter && !changed);
+
             _lastSent[address][nibble] = nibData;  // keep the cache up to date either way,
                                                     // so re-enabling the filter later doesn't
                                                     // cause a spurious "changed" burst for
@@ -231,9 +255,15 @@ void RsBusHal::loop() {
         }
     }
 
-    if (changedCount == 0) return;
+    if (changedCount == 0) {
+        _checkWatchdog(now);
+        return;
+    }
 
     gLeds.onRsBusTraffic();
+
+    traceLog().logf(TraceLevel::DEBUG, TraceSource::RS_BUS,
+                     "BC publishing %u changed pair(s)", changedCount);
 
     // Publish all changes as a single FEEDBACK_BULK event
     Event ev = Ev::feedbackBulk(ModuleId::RS_BUS_HAL,
@@ -271,4 +301,54 @@ void RsBusHal::clearAll() {
     memset(_type,     0, sizeof(_type));
     memset(_lastSent, 0, sizeof(_lastSent));
     memset((void*)rsBus.fbState, 0, sizeof(rsBus.fbState));  // also the library's own table
+}
+
+// ─────────────────────────────────────────────────────────────
+//  _checkWatchdog() — recover from a stuck RSbusMaster PIO state
+//  machine without requiring a full command-station reset.
+//
+//  Confirmed on the tmc-baan (Rob, log analysis): RS-Bus reception
+//  stopped entirely mid-session — no genuine poll result of any kind
+//  for over 2.5 minutes — with no POWER_OFF/ON event in between, while
+//  XpressNet traffic on the very same core kept responding completely
+//  normally throughout (ruling out a general core1/loop() hang). Only
+//  a full command-station reset recovered it; toggling track power
+//  alone did not (RsBusHal::onEvent()'s own POWER_ON/OFF handlers only
+//  start()/stop() the library, they never re-init() the PIO program
+//  itself). This points at the underlying RSbusMaster PIO state
+//  machine itself getting stuck — plausibly from noise/a bad signal on
+//  the physical RS-Bus line (Rob: moving the connection point and
+//  disabling one detector made the problem go away for that session),
+//  which is outside this codebase's own logic to prevent, but the
+//  resulting stuck state can still be recovered from automatically
+//  here rather than requiring Rob to power-cycle the whole centrale.
+//
+//  Only acts while track power is genuinely on (_powered) — RS-Bus
+//  decoders can legitimately go quiet for extended periods otherwise
+//  (e.g. an unoccupied layout section), so silence alone is only a
+//  meaningful signal of a stuck state while trains could plausibly be
+//  triggering feedback.
+// ─────────────────────────────────────────────────────────────
+void RsBusHal::_checkWatchdog(uint32_t now) {
+    if (!_powered) return;
+
+    // rsbus.watchdog_s — configurable via the web interface (RS-Bus
+    // panel); 0 disables the watchdog entirely, for anyone who'd
+    // rather investigate a stall themselves than have it silently
+    // recovered.
+    uint16_t timeoutS = eepromStore().getUint16("rsbus.watchdog_s", 15);
+    if (timeoutS == 0) return;
+
+    if (now - _lastRxMs < (uint32_t)timeoutS * 1000) return;
+
+    traceLog().logf(TraceLevel::WARNING, TraceSource::RS_BUS,
+                     "watchdog: no RS-Bus traffic for %us while powered — "
+                     "re-initialising PIO", timeoutS);
+
+    rsBus.stop();
+    rsBus.init(RS_BUS_TX_PIN, RS_BUS_RX_PIN, RS_BUS_PIO);
+    rsBus.start();
+    _lastRxMs = now;  // restart the watchdog window from here, not from the
+                       // stale silence — avoids re-triggering every loop()
+                       // call if the underlying cause hasn't actually cleared
 }

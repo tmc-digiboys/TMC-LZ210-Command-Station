@@ -1012,14 +1012,21 @@ void Z21Lan::_handleGetTurnoutMode(Z21Client& c, const uint8_t* data, uint8_t le
 //  call).
 //
 //  FEEDBACK: translates a single RS-Bus module/nibble update into the
-//  corresponding LAN_RMBUS_DATACHANGED group packet — computing which
-//  group and byte position the module falls into, and packing the new
-//  nibble value into the correct half of that byte (low nibble for
-//  nibble 0, high nibble for nibble 1) within an otherwise all-zero
-//  10-byte data block. Note that this only reports the single changed
-//  nibble's own byte accurately; the other 9 bytes in the group are
-//  sent as zero rather than their actual current values. Sent to
-//  every currently active client, regardless of broadcast flags.
+//  corresponding LAN_RMBUS_DATACHANGED group packet. Updates
+//  _z21ModuleState[] (the persistent, full 8-bit state of every
+//  module) with the new nibble value, then reassembles and sends the
+//  GENUINE, CURRENT state of all 10 modules in that group — not just
+//  the one that changed. An earlier version sent only the single
+//  changed module's byte with the other 9 zeroed, which would make a
+//  Z21 client believe those other 9 modules had all just become free
+//  (confirmed against the official, open-source Z21 firmware's own
+//  setS88Data(), which always takes a full, pre-assembled 10-byte
+//  group — never a partial one). Also corrects the payload size to
+//  15 bytes (2 length + 2 header + 1 group + 10 data), matching that
+//  same reference's own DataLen=0x0F for this message — the previous
+//  14-byte payload had room for only 9 data bytes, one short of a
+//  full group. Sent to every currently active client, regardless of
+//  broadcast flags.
 // ─────────────────────────────────────────────────────────────
 void Z21Lan::onEvent(const Event& ev) {
     // Power events — send LAN_SYSTEMSTATE_DATACHANGED to all clients
@@ -1041,20 +1048,28 @@ void Z21Lan::onEvent(const Event& ev) {
         return;
     }
     if (ev.type == EvType::FEEDBACK) {
-        uint8_t addr    = ev.fbModule;
-        uint8_t group   = (addr - 1) / 10;
-        uint8_t pos     = (addr - 1) % 10;
+        uint8_t addr    = ev.fbModule;  // 1-based
+        if (addr == 0 || addr > sizeof(_z21ModuleState)) return;
         uint8_t nibData = ev.fbDat & 0x0F;
 
-        uint8_t payload[14] = {};
-        _putU16le(payload,   14);
+        // Update this module's persistent, full 8-bit state — only
+        // the half (nibble) this event actually reports changes.
+        uint8_t& modState = _z21ModuleState[addr - 1];
+        if (ev.fbNibble == 0) modState = (modState & 0xF0) | nibData;
+        else                  modState = (modState & 0x0F) | (nibData << 4);
+
+        uint8_t group    = (addr - 1) / 10;
+        uint8_t groupBase = group * 10;  // first module (0-based) in this group
+
+        uint8_t payload[15] = {};
+        _putU16le(payload,   15);
         _putU16le(payload+2, Z21Hdr::LAN_RMBUS_DATACHANGED);
         payload[4] = group;
-        uint8_t bytePos = pos / 2;
-        if (ev.fbNibble == 0)
-            payload[5 + bytePos] = (payload[5 + bytePos] & 0xF0) | nibData;
-        else
-            payload[5 + bytePos] = (payload[5 + bytePos] & 0x0F) | (nibData << 4);
+        for (uint8_t p = 0; p < 10; p++) {
+            uint8_t moduleIdx0 = groupBase + p;  // 0-based
+            if (moduleIdx0 < sizeof(_z21ModuleState))
+                payload[5 + p] = _z21ModuleState[moduleIdx0];
+        }
 
         // This broadcast arrives via EventBus (core0's RsBusHal
         // publishing a FEEDBACK event), not via the RX/-> XN read-
@@ -1063,10 +1078,24 @@ void Z21Lan::onEvent(const Event& ev) {
         // actually built and sent (Rob: RS-Bus broadcasts weren't
         // visible in TraceLog despite the rest of Z21 traffic being
         // covered).
-        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "BC", payload, 14);
+        //
+        // Logged only when there is genuinely at least one active
+        // client to send to — previously this logged unconditionally
+        // before the loop below even checked for one, so a "Z21 BC"
+        // line appeared in TraceLog even with zero connected clients
+        // and nothing actually transmitted, confusingly suggesting a
+        // phantom Z21 client (Rob: saw this despite the web
+        // interface's own client list correctly showing none).
+        bool anyActive = false;
         for (uint8_t i = 0; i < Z21_MAX_CLIENTS; i++) {
-            if (_clients[i].active)
-                _send(_clients[i], payload, 14);
+            if (_clients[i].active) { anyActive = true; break; }
+        }
+        if (anyActive) {
+            traceLog().logBytes(TraceLevel::DEBUG, TraceSource::Z21, "BC", payload, 15);
+            for (uint8_t i = 0; i < Z21_MAX_CLIENTS; i++) {
+                if (_clients[i].active)
+                    _send(_clients[i], payload, 15);
+            }
         }
     }
 }

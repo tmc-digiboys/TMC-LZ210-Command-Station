@@ -398,7 +398,10 @@ void LenzUsb::onEvent(const Event& ev) {
 
     // Forward a single RS-Bus feedback pair as a BC "Rückmeldung" packet (N=2 → 0x42)
     if (ev.type == EvType::FEEDBACK) {
-        uint8_t addrByte = ev.fbModule & 0x7F;
+        // Module address is 0-based in this protocol byte per
+        // XpressNet spec §2.1.11 — see LenzLan::onEvent()'s own
+        // comment on the identical fix there for the full rationale.
+        uint8_t addrByte = (ev.fbModule - 1) & 0x7F;
         uint8_t dataByte = 0x40 | (ev.fbNibble ? 0x10 : 0x00) | (ev.fbDat & 0x0F);
         uint8_t kennung  = 0x42;  // N=2 (one pair)
         uint8_t xorVal   = kennung ^ addrByte ^ dataByte;

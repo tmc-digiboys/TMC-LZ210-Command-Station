@@ -108,11 +108,30 @@ public:
     uint8_t connectionCount() const override { return _clientCount; }
     uint8_t maxConnections()  const override { return Z21_MAX_CLIENTS; }
 
+    // Read-only access to a client slot, for the web interface's own
+    // status display (Rob: wanted to see which IP is registered as an
+    // "active" Z21 client, to identify a stale/unexpected registration
+    // rather than guessing from memory).
+    const Z21Client& clientAt(uint8_t i) const { return _clients[i]; }
+
 private:
     EthernetUDP _udp;
     Z21Client   _clients[Z21_MAX_CLIENTS];
     uint8_t     _clientCount = 0;
     uint8_t     _txBuf[Z21_UDP_BUF];
+
+    // Last-known full 8-bit state of each RS-Bus module (1-128,
+    // 1-based index 1..128 stored at [0..127]) — needed because a
+    // genuine LAN_RMBUS_DATACHANGED broadcast must report the CURRENT
+    // state of all 10 modules in its group, not just the one that
+    // changed (confirmed against the official, open-source Z21
+    // firmware's own setS88Data(), which always takes a full,
+    // pre-assembled 10-byte group). The previous implementation sent
+    // only the single changed module's byte with the other 9 zeroed,
+    // which would make a Z21 client believe those other modules had
+    // all just become free — this cache lets onEvent() reassemble the
+    // genuine, full group on every update instead.
+    uint8_t _z21ModuleState[128] = {};
 
     // Dispatches one received UDP packet to the appropriate handler.
     // Validates the packet's stated length against the actual number
@@ -158,6 +177,7 @@ private:
     // LAN_LOCONET_DISPATCH_ADDR — dispatches an LN_DISPATCH command
     // for the given LocoNet address onto the command bus.
     void _handleLocoNetDispatch      (Z21Client& c, const uint8_t* data, uint8_t len);
+    void _handleLocoNetFromLan       (Z21Client& c, const uint8_t* data, uint8_t len);
     // LAN_RMBUS_GETDATA — replies with the current RS-Bus feedback
     // state for one group of 10 modules.
     void _handleRmbusGetData         (Z21Client& c, const uint8_t* data, uint8_t len);

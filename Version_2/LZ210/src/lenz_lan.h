@@ -116,6 +116,31 @@ private:
     uint8_t _fbQueueData[LENZ_LAN_FB_QUEUE_SIZE];
     uint8_t _fbQueueCount = 0;
 
+    // Last nibble value actually SENT for each (module, nibble) pair —
+    // one byte per module (0-127), low nibble = nibble 0, high nibble
+    // = nibble 1. Treated as one continuous 1024-bit space (bit
+    // position = byteIdx*8 + bitIdx) by _setFeedbackBitStepped() below,
+    // which is what lets a single LocoNet sensor's XpressNet-specific
+    // +1-shifted target land in a different module/nibble than the
+    // raw LocoNet event itself, and also ensures every update actually
+    // transmitted changes only one bit relative to the last value sent
+    // for that module+nibble (confirmed necessary against Rob's own
+    // tcpdump + Rocrail's server log: Rocrail's own XpressNet decoder
+    // misidentifies which sensor changed whenever more than one bit
+    // within a nibble changes between two consecutive packets for that
+    // module+nibble).
+    uint8_t _lastSentNibble[128] = {};
+
+    // Sets one bit, at a GLOBAL bit position spanning the whole
+    // _lastSentNibble[] cache (module byte = pos/8, bit = pos%8), to
+    // the given state, and — only if this actually changes that bit —
+    // sends the resulting, complete 4-bit nibble containing it as a
+    // single XpressNet feedback packet. See this method's own comment
+    // in lenz_lan.cpp, and onEvent()'s own comment on why the incoming
+    // LocoNet sensor position is shifted by +1 before being passed in
+    // here.
+    void _setFeedbackBitStepped(uint16_t globalBitPos, bool state);
+
     // Queue RS-Bus feedback pairs for deferred sending
     void _queueFeedback(const uint8_t* addr, const uint8_t* data, uint8_t count);
 

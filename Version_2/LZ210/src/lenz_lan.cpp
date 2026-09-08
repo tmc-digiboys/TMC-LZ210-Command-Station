@@ -554,12 +554,37 @@ void LenzLan::onEvent(const Event& ev) {
         return;
     }
     if (ev.type == EvType::FEEDBACK) {
-        uint8_t addrByte = ev.fbModule & 0x7F;
-        uint8_t dataByte = 0x40 | (ev.fbNibble ? 0x10 : 0x00) | (ev.fbDat & 0x0F);
-        if (_txBusy) {
-            _queueFeedback(&addrByte, &dataByte, 1);
-        } else {
-            _sendFeedbackBulk(&addrByte, &dataByte, 1);
+        // §2.15 "Schaltinformation" / XpressNet spec §2.1.11: the
+        // feedback module address in this protocol byte is 0-based —
+        // but this branch is reached ONLY for LocoNet-derived feedback
+        // (EvType::FEEDBACK, singular; see slot_server.cpp's own
+        // _handleInputRep()) — RS-Bus always publishes via the
+        // separate EvType::FEEDBACK_BULK branch above, which this does
+        // not touch, so this shift applies only to LocoNet sensors,
+        // never RS-Bus (Rob: explicitly confirmed RS-Bus must stay
+        // exactly as-is).
+        //
+        // Confirmed against Rob's own tcpdump + Rocrail's own server
+        // log ("Sensor N=on"): for LocoNet-derived feedback, Rocrail's
+        // XpressNet decoder consistently reports (raw LocoNet address)
+        // rather than (raw address + 1) — i.e. it uses
+        // module_byte_received*8 + bitpos directly, with no further
+        // "+1" of its own — while LocoNet's own direct decode and Z21
+        // both correctly show (raw address + 1), matching the
+        // module's own physical "programmed to address N" label. To
+        // make XpressNet show that same, expected (address + 1) label,
+        // the bit this event represents is shifted by +1 in a
+        // continuous, cross-module bit space (see _lastSentNibble's
+        // own comment) before being placed into a module/nibble byte
+        // for transmission — necessarily so, since a fixed module-only
+        // offset can only shift results in whole multiples of 8, never
+        // by exactly 1 (confirmed by direct calculation: every
+        // bitpos within a module produced the identical off-by-one,
+        // ruling out a per-bit-position-dependent cause).
+        uint16_t rawBase = (uint16_t)(ev.fbModule - 1) * 8 + (ev.fbNibble ? 4 : 0);
+        uint8_t  dat     = ev.fbDat & 0x0F;
+        for (uint8_t b = 0; b < 4; b++) {
+            _setFeedbackBitStepped(rawBase + b + 1, (dat & (1 << b)) != 0);
         }
         return;
     }
@@ -571,6 +596,54 @@ void LenzLan::onEvent(const Event& ev) {
 //  Called from onEvent() when _txBusy is set. Appends addr/data
 //  pairs to the queue. Excess pairs are dropped if queue is full.
 // ─────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────
+//  _setFeedbackBitStepped() — sets one bit, at a GLOBAL, continuous
+//  bit position (module byte = pos/8, bit-within-byte = pos%8) across
+//  the whole _lastSentNibble[] cache, to the given state — and, only
+//  if this actually changes that bit, sends the resulting, complete
+//  4-bit nibble containing it as a single XpressNet feedback packet.
+//
+//  Treating _lastSentNibble[128] as one continuous 1024-bit space
+//  (rather than 128 independent module bytes) is what lets a single
+//  LocoNet sensor's +1-shifted target land in a different module or
+//  nibble than the one the raw LocoNet event itself belongs to — e.g.
+//  the last bit of one module's high nibble shifts into the first bit
+//  of the NEXT module's low nibble — without any special-casing for
+//  that boundary: the byte/bit split below handles it uniformly.
+//
+//  Only sending when the bit genuinely changes relative to
+//  _lastSentNibble's own last-sent record is also what keeps every
+//  transmitted update to a single-bit change relative to the previous
+//  one for that module+nibble (the same rationale the earlier,
+//  now-superseded _sendSingleFeedbackStepped() existed for) — calling
+//  this once per bit of an incoming nibble update naturally produces
+//  that, with no separate stepping loop needed.
+// ─────────────────────────────────────────────────────────────
+void LenzLan::_setFeedbackBitStepped(uint16_t globalBitPos, bool state) {
+    uint16_t byteIdx = globalBitPos / 8;
+    uint8_t  bitIdx  = globalBitPos % 8;
+    if (byteIdx >= sizeof(_lastSentNibble)) return;  // out of the 128-module range
+
+    uint8_t mask    = 1 << bitIdx;
+    bool    current = (_lastSentNibble[byteIdx] & mask) != 0;
+    if (current == state) return;  // already at this value — nothing to send
+
+    if (state) _lastSentNibble[byteIdx] |= mask;
+    else       _lastSentNibble[byteIdx] &= (uint8_t)~mask;
+
+    bool    nibbleFlag = bitIdx >= 4;
+    uint8_t nibbleVal  = nibbleFlag ? (_lastSentNibble[byteIdx] >> 4)
+                                    : (_lastSentNibble[byteIdx] & 0x0F);
+    uint8_t addrByte   = (uint8_t)byteIdx;
+    uint8_t dataByte   = 0x40 | (nibbleFlag ? 0x10 : 0x00) | nibbleVal;
+    if (_txBusy) {
+        _queueFeedback(&addrByte, &dataByte, 1);
+    } else {
+        _sendFeedbackBulk(&addrByte, &dataByte, 1);
+    }
+}
+
 void LenzLan::_queueFeedback(const uint8_t* addr, const uint8_t* data,
                                uint8_t count) {
     for (uint8_t i = 0; i < count && _fbQueueCount < LENZ_LAN_FB_QUEUE_SIZE; i++) {
@@ -612,7 +685,12 @@ void LenzLan::_flushPendingFeedback() {
 // ─────────────────────────────────────────────────────────────
 void LenzLan::_sendFeedbackBulk(const uint8_t* addr, const uint8_t* data,
                                   uint8_t count) {
-    if (count == 0 || _connCount == 0) return;
+    if (count == 0 || _connCount == 0) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::XN_LAN,
+                         "_sendFeedbackBulk early-return: count=%u connCount=%u",
+                         count, _connCount);
+        return;
+    }
 
     uint8_t pkt[10];
     pkt[0] = 0xFF; pkt[1] = 0xFD;
@@ -634,6 +712,7 @@ void LenzLan::_sendFeedbackBulk(const uint8_t* addr, const uint8_t* data,
         uint8_t pktLen = 3 + pairCount * 2 + 1;
         pkt[pktLen - 1] = xorVal;
 
+        traceLog().logBytes(TraceLevel::DEBUG, TraceSource::XN_LAN, "TCP TX (feedback)", pkt, pktLen);
         for (uint8_t s = 0; s < LENZ_LAN_MAX_CLIENTS; s++)
             _sendRaw(_clients[s], pkt, pktLen);
     }
