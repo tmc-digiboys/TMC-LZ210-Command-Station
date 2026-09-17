@@ -193,6 +193,20 @@ public:
     // onPowerOnClear()) is called.
     void onShortCircuit()    { status.setBlinkMs(100); status.setMode(LedMode::LED_BLINK); }
 
+    // onEmergencyStop() — call when an emergency-stop broadcast has
+    // gone out (CmdType::EMERGENCY_STOP — e.g. the LH100's STOP
+    // button), as distinct from an actual track-power-off. Track
+    // power itself stays on in this case (see DccHal::emergencyStop()
+    // — it does not call setPower()), so a slower 300ms blink is used
+    // here rather than short-circuit's 100ms one, so the two visually
+    // distinct fault/notice conditions don't look identical on the
+    // board. There is currently no separate "resume" signal in this
+    // protocol to clear this automatically (XpressNet operations
+    // typically just resume on the next loco command) — this blink
+    // persists until the next onPowerOn()/onPowerOff() (i.e. the next
+    // real power cycle).
+    void onEmergencyStop()   { status.setBlinkMs(300); status.setMode(LedMode::LED_BLINK); }
+
     // onPowerOnClear() — call to restore the normal "power on" LED
     // state after a short circuit condition has cleared. Functionally
     // identical to onPowerOn(); kept as a separate, more descriptively

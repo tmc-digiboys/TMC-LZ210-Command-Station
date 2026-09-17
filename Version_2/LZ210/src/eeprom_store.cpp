@@ -36,19 +36,19 @@ void EepromStore::begin() {
         // LittleFS mount failed — try to format
         // Most common cause: no FS partition configured
         // in the Arduino IDE (Tools → Flash Size → choose an option with FS)
-        traceSerial.println("LittleFS: start mislukt, probeer format...");
+        traceSerial.println("LittleFS: start failed, try format...");
         if (!LittleFS.format() || !LittleFS.begin()) {
-            traceSerial.println("LittleFS: format mislukt — "
-                            "gebruik standaard waarden (geen persistentie)");
+            traceSerial.println("LittleFS: format failed — "
+                            "use default values(no persistency)");
             traceSerial.println("Fix: Arduino IDE → Tools → Flash Size → "
-                            "kies optie met FS (bijv. 2MB Sketch + 1MB FS)");
+                            "choose option with FS (bijv. 1.9MB Sketch + 128 KB FS)");
             // Continue without persistence — default values will be used
             _fsOk = false;
             _lastChangeMs = 0;
             _dirty = false;
             return;
         }
-        traceSerial.println("LittleFS: format geslaagd");
+        traceSerial.println("LittleFS: format succeeded");
     }
     _fsOk = true;
     load();
@@ -92,9 +92,31 @@ void EepromStore::loop() {
 
 bool EepromStore::_registerParam(const char* key, ParamType type,
                                   uint8_t size, uint8_t moduleId) {
-    if (_count >= EEPROM_MAX_PARAMS)    return false;
-    if (strlen(key) >= EEPROM_KEY_MAX_LEN) return false;
-    if (_indexOf(key) >= 0)             return false;
+    if (_count >= EEPROM_MAX_PARAMS) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::SYSTEM,
+                         "register '%s' FAILED: table full (EEPROM_MAX_PARAMS=%d)",
+                         key, EEPROM_MAX_PARAMS);
+        return false;
+    }
+    if (strlen(key) >= EEPROM_KEY_MAX_LEN) {
+        // This exact failure mode previously cost a long debugging
+        // session (Rob): the parameter silently never registers, so
+        // getUint16()/etc. always fall back to their caller-supplied
+        // default and the web interface's _printField() renders
+        // nothing for it — nothing crashes or errors, it just quietly
+        // doesn't exist. Logging it here means it shows up in TraceLog
+        // immediately instead of only being discoverable by manually
+        // comparing key lengths against EEPROM_KEY_MAX_LEN.
+        traceLog().logf(TraceLevel::WARNING, TraceSource::SYSTEM,
+                         "register '%s' FAILED: key is %d chars, max is %d",
+                         key, (int)strlen(key), EEPROM_KEY_MAX_LEN - 1);
+        return false;
+    }
+    if (_indexOf(key) >= 0) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::SYSTEM,
+                         "register '%s' FAILED: already registered", key);
+        return false;
+    }
 
     ParamDef& p = _params[_count++];
     strncpy(p.key, key, EEPROM_KEY_MAX_LEN - 1);
@@ -545,7 +567,7 @@ bool EepromStore::saveAccessories() {
     }
 
     f.close();
-    traceSerial.println("EepromStore: accessories opgeslagen");
+    traceSerial.println("EepromStore: accessories stored");
     return true;
 }
 
@@ -561,7 +583,7 @@ bool EepromStore::loadAccessories() {
 
     File f = LittleFS.open(ACCESSORIES_FILE, "r");
     if (!f) {
-        traceSerial.println("EepromStore: geen accessories bestand");
+        traceSerial.println("EepromStore: no accessories file");
         return false;
     }
 
@@ -571,7 +593,7 @@ bool EepromStore::loadAccessories() {
 
     if (magic != 0x53574143 || count != MAX_ACCESSORIES) {
         f.close();
-        traceSerial.println("EepromStore: accessories formaat ongeldig");
+        traceSerial.println("EepromStore: accessories format invalid");
         return false;
     }
 
@@ -586,6 +608,6 @@ bool EepromStore::loadAccessories() {
     }
 
     f.close();
-    traceSerial.printf("EepromStore: %u wissels geladen\n", loaded);
+    traceSerial.printf("EepromStore: %u accessories loaded\n", loaded);
     return true;
 }

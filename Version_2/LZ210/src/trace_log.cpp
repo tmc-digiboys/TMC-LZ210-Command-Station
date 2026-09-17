@@ -329,7 +329,13 @@ void TraceLog::_refreshConfig() {
     if (!enabled) {
         // Just turned off — close everything.
         if (_client) _client.stop();
-        if (_server) { delete _server; _server = nullptr; }
+        // Destroy via explicit dtor + operator delete rather than
+        // `delete _server` — EthernetServer has a non-virtual
+        // destructor, and _server's static and dynamic type are
+        // always exactly EthernetServer here, so this is equivalent
+        // and well-defined, but avoids the compiler's (otherwise
+        // correct in general) -Wdelete-non-virtual-dtor warning.
+        if (_server) { _server->~EthernetServer(); ::operator delete(_server); _server = nullptr; }
         _enabledCached = false;
         _portCached    = port;
         return;
@@ -337,7 +343,7 @@ void TraceLog::_refreshConfig() {
 
     // Turning on, or the port changed while already on — (re)open.
     if (_client) _client.stop();
-    if (_server) { delete _server; _server = nullptr; }
+    if (_server) { _server->~EthernetServer(); ::operator delete(_server); _server = nullptr; }
     _server = new EthernetServer(port);
     _server->begin();
     _enabledCached = true;

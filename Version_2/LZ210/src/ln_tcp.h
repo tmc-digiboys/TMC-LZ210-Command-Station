@@ -91,14 +91,28 @@ enum class LnTcpProtocol : uint8_t { UNKNOWN, RAW, ASCII };
 
 struct LnTcpClient {
     EthernetClient tcp;
+    IPAddress      ip;    // Client IP — cached at accept time; see LenzClient's own
+                           // comment on why (EthernetClient::remoteIP()/remotePort()
+                           // are not const in this Ethernet library, so cannot be
+                           // called through the const LnTcpClient& clientAt() hands
+                           // out to the web interface).
+    uint16_t       port;  // Client TCP port — cached, same reason as ip
     LnTcpProtocol  protocol;
     uint8_t        msgBuf[LN_TCP_MSG_BUF];   // RAW protocol accumulation
     uint8_t        msgLen;
     char           lineBuf[LN_TCP_LINE_BUF]; // ASCII protocol accumulation
     uint8_t        lineLen;
     bool           active;
+    // millis() timestamp at which this slot's connection was accepted.
+    // Unlike LenzLan/Z21Lan there is no idle-timeout concept here (the
+    // LocoNet-over-TCP protocols define no lifecheck/keepalive; a dead
+    // connection is instead detected via tcp.connected() in loop()) —
+    // this is purely for the web interface's own "connected for Xs"
+    // display, see clientAt().
+    uint32_t       connectedMs;
 
-    LnTcpClient() : protocol(LnTcpProtocol::UNKNOWN), msgLen(0), lineLen(0), active(false) {}
+    LnTcpClient() : port(0), protocol(LnTcpProtocol::UNKNOWN), msgLen(0), lineLen(0),
+                    active(false), connectedMs(0) {}
 };
 
 class LnTcp : public HardwareModule, public LocoNetConsumer {
@@ -133,11 +147,20 @@ public:
     // that could BE the reason a send needs retrying.
     LN_STATUS onMessage(const LnMsg& msg) override;
 
+    uint8_t connectionCount() const override { return _connCount; }
+    uint8_t maxConnections()  const override { return LN_TCP_MAX_CLIENTS; }
+
+    // Read-only access to a client slot, for the web interface's own
+    // "Active Clients" table — same pattern as Z21Lan::clientAt() and
+    // LenzLan::clientAt().
+    const LnTcpClient& clientAt(uint8_t i) const { return _clients[i]; }
+
 private:
     LnTcpClient      _clients[LN_TCP_MAX_CLIENTS];
     EthernetServer*  _server        = nullptr;
     bool             _enabledCached = false;
     uint16_t         _portCached    = 0;
+    uint8_t          _connCount     = 0;
 
     // _refreshConfig() — see TraceLog::_refreshConfig()'s own comment
     // for the identical pattern.

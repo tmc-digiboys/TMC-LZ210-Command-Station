@@ -413,7 +413,7 @@ uint8_t XpressNetHandler::buildSearchResult(uint8_t* buf,
 //                   message: 0x42|adr|state|X-or
 // ─────────────────────────────────────────────────────────────
 uint8_t XpressNetHandler::buildSwitchInfo(uint8_t* buf, uint8_t adr,
-                                            uint8_t nibble, uint8_t state) {
+                                            uint8_t /*nibble*/, uint8_t state) {
     buf[0] = 0x42; buf[1] = adr; buf[2] = state;
     buf[3] = xorCheck(buf, 3); return 4;
 }
@@ -1358,7 +1358,7 @@ XNHandleResult XpressNetHandler::handlePOM(const uint8_t* in, uint8_t il,
 //                      mode setting implemented yet); always
 //                      acknowledged.
 // ─────────────────────────────────────────────────────────────
-XNHandleResult XpressNetHandler::handleSetStartMode(const uint8_t* in, uint8_t il,
+XNHandleResult XpressNetHandler::handleSetStartMode(const uint8_t* /*in*/, uint8_t /*il*/,
                                                       uint8_t* r, uint8_t& l) {
     l = buildOk(r); return XNHandleResult::OK_SILENT;
 }
@@ -1467,7 +1467,7 @@ XNHandleResult XpressNetHandler::handleFastClockStop(uint8_t* r, uint8_t& l) {
 //               watchdog (letting the watchdog trigger an actual
 //               hardware reset shortly after).
 // ─────────────────────────────────────────────────────────────
-XNHandleResult XpressNetHandler::handleReset(uint8_t* r, uint8_t& l) {
+XNHandleResult XpressNetHandler::handleReset(uint8_t* /*r*/, uint8_t& l) {
     gCentrale.emergencyStop  = false;
     gCentrale.trackPowerOff  = true;
     gCentrale.progModeActive = false;

@@ -117,6 +117,28 @@ void Webserver::_handleClient(EthernetClient& client) {
             _sendRedirect(client, "/");
             return;
         }
+        if (_pathEquals(req.path, "/reboot")) {
+            // Plain hardware reboot — no settings/data are touched.
+            // Reuses the exact same mechanism as
+            // XpressNetHandler::handleReset() (the 0x21/0x24 XpressNet
+            // reset command): sets gResetRequested, which makes core0
+            // stop feeding the watchdog, so the watchdog itself
+            // triggers the actual hardware reset shortly after (see
+            // LZ210.ino's loop() and its comment on gResetRequested).
+            // Doesn't call the XpressNet-specific broadcastPowerOff()
+            // (a private XpressNetHandler member, not reachable from
+            // here) — setting trackPowerOff below already reflects
+            // the power-off in internal state and stops DCC output.
+            gCentrale.emergencyStop  = false;
+            gCentrale.trackPowerOff  = true;
+            gCentrale.progModeActive = false;
+            Serial2.println("REBOOT: web interface requested restart...");
+            Serial2.flush();
+            extern volatile bool gResetRequested;
+            gResetRequested = true;
+            _sendRedirect(client, "/?p=systeem");
+            return;
+        }
         if (_pathEquals(req.path, "/fabriek")) {
             // Look for the confirmation checkbox in the body
             char body[64] = {};
@@ -346,6 +368,18 @@ void Webserver::_printField(EthernetClient& c, const char* key,
 }
 
 // ─────────────────────────────────────────────────────────────
+//  _autoRefresh() — see webserver.h for the full reasoning behind
+//  a plain setTimeout(reload) instead of <meta http-equiv='refresh'>.
+//  seconds==0 disables (prints nothing).
+// ─────────────────────────────────────────────────────────────
+void Webserver::_autoRefresh(EthernetClient& c, uint16_t seconds) {
+    if (seconds == 0) return;
+    c.print(F("<script>setTimeout(()=>location.reload(),"));
+    c.print((uint32_t)seconds * 1000UL);
+    c.print(F(");</script>"));
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Root handler — one page with all panels and the sidebar
 // ─────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────
@@ -443,7 +477,7 @@ void Webserver::_shellOpen(EthernetClient& c, const char* active,
               "<link rel='stylesheet' href='/style.css'>"
               "</head><body>"
               "<div id='hdr'>"
-              "<h1>&#9650; TMC Centrale</h1>"
+              "<h1>&#9650; TMC Command Station</h1>"
               "<span class='v'>RP2350 DCC v2.0</span>"
               "</div>"
               "<div id='wr'>"
@@ -528,6 +562,9 @@ void Webserver::_panelSysteem(EthernetClient& c) {
               "different wiring) may need opposite settings here.</p>"));
     _printField(c, "sys.turnout_invert", "Invert turnout output bit");
     c.print(F("</fieldset>"));
+    c.print(F("<fieldset><legend>Startup</legend>"));
+    _printField(c, "dcc.startup_power", "Power state at startup");
+    c.print(F("</fieldset>"));
     c.print(F("<fieldset><legend>CDE Booster short-circuit response</legend>"
               "<p class='hint'>Sets how the LZ210 responds when a CDE booster"
               " detects a short circuit (E-signal held continuously low longer"
@@ -540,6 +577,7 @@ void Webserver::_panelSysteem(EthernetClient& c) {
     _printField(c, "sys.cde_short_mv", "Short-circuit voltage threshold (mV)");
     _printField(c, "sys.cde_short_us", "Short-circuit duration threshold (&micro;s)");
     _printField(c, "sys.cde_clear_us", "Recovery-confirm debounce (&micro;s)");
+    _printField(c, "sys.cde_grace_ms", "Startup grace period (ms)");
     c.print(F("</fieldset>"
               "<fieldset><legend>H-bridge nFAULT escalation (v2 hardware)</legend>"
               "<p class='hint'>An isolated nFAULT blip on any of the three "
@@ -549,13 +587,40 @@ void Webserver::_panelSysteem(EthernetClient& c) {
               "the window below, OR nFAULT is observed continuously low for "
               "at least the duration below (needed since a genuinely "
               "persistent fault doesn't always trigger the first check under "
-              "automatic-retry).</p>"));
-    _printField(c, "sys.fault_window_ms",   "Window (ms)");
-    _printField(c, "sys.fault_retry_count", "Faults within window to escalate");
-    _printField(c, "sys.fault_duration_ms", "Continuous-low duration to escalate (ms)");
-    _printField(c, "sys.fault_clear_ms", "Recovery-confirm debounce (ms)");
+              "automatic-retry). Configured per bridge, since the CDE "
+              "bridge is a different chip variant (DRV8876 vs the DCC "
+              "bridge's DRV8874) and may need different tuning.</p>"));
+    const struct { const char* prefix; const char* label; } faultBridges[] = {
+        { "dcc", "DCC" }, { "sm", "SM/programming track" }, { "cde", "CDE" },
+    };
+    for (auto& b : faultBridges) {
+        char key[24];
+        c.print(F("<h4>")); c.print(b.label); c.print(F("</h4>"));
+        snprintf(key, sizeof(key), "%s.fault_window_ms", b.prefix);
+        _printField(c, key, "Window (ms)");
+        snprintf(key, sizeof(key), "%s.fault_retry_count", b.prefix);
+        _printField(c, key, "Faults within window to escalate");
+        snprintf(key, sizeof(key), "%s.fault_duration_ms", b.prefix);
+        _printField(c, key, "Continuous-low duration to escalate (ms)");
+        snprintf(key, sizeof(key), "%s.fault_clear_ms", b.prefix);
+        _printField(c, key, "Recovery-confirm debounce (ms)");
+    }
     c.print(F("</fieldset>"
               "<button class='btn'>Save</button></form>"));
+
+    // Plain reboot — no settings/data touched, just a hardware
+    // restart. Same JS-confirm + fetch() pattern as the existing
+    // "Web Interface" panel's settings-reset button, since a reboot
+    // is similarly non-destructive but still worth an explicit
+    // confirmation to avoid an accidental click.
+    c.print(F("<fieldset><legend>Restart</legend>"
+              "<p class='hint'>Performs a plain hardware restart — no "
+              "settings, locomotives, turnouts or feedback data are "
+              "affected.</p>"
+              "<button class='btn bs' type='button'"
+              " onclick=\"if(confirm('Restart the LZ210?'))"
+              "{fetch('/reboot',{method:'POST'}).then(()=>location.reload());}\">"
+              "Restart</button></fieldset>"));
 
     // CommandBus drop log — see command_bus.h's public accessors'
     // comment. A dropped command means the ring buffer (32 slots) was
@@ -564,13 +629,13 @@ void Webserver::_panelSysteem(EthernetClient& c) {
     // if core0 stalls, but worth surfacing here since most dropped
     // commands are otherwise silently lost with no other indication.
     CommandBus& bus = CommandBus::instance();
-    c.print(F("<h3>CommandBus drop log</h3><p>Totaal verloren commando's "
-              "sinds opstarten: "));
+    c.print(F("<h3>CommandBus drop log</h3><p>Total lost commands "
+              "till now from booting: "));
     c.print(bus.dropTotal());
     c.print(F("</p>"));
     uint8_t n = bus.dropLogCount();
     if (n == 0) {
-        c.print(F("<p class='hint'>Geen commando's verloren.</p>"));
+        c.print(F("<p class='hint'>No command lost.</p>"));
     } else {
         c.print(F("<table><tr><th>Tijd (ms)</th><th>Bron</th><th>Commando</th></tr>"));
         for (uint8_t i = 0; i < n; i++) {
@@ -628,6 +693,29 @@ void Webserver::_panelLenzLan(EthernetClient& c) {
     _printField(c, "xn.kennung", "Kennung");
     _printField(c, "xn.li_address", "Interface device address (SV1, 1-31)");
     c.print(F("</fieldset><button class='btn'>Save</button></form>"));
+
+    // Status: which clients are currently connected — same rationale
+    // as Z21's own "Active Clients" table (see _panelZ21()).
+    c.print(F("<fieldset><legend>Active Clients</legend><table>"
+              "<tr><th>IP</th><th>Port</th><th>Last seen</th><th>Prog mode</th></tr>"));
+    uint32_t now = millis();
+    bool any = false;
+    for (uint8_t i = 0; i < LENZ_LAN_MAX_CLIENTS; i++) {
+        const LenzClient& cl = gLenzLan.clientAt(i);
+        if (!cl.active) continue;
+        any = true;
+        c.print(F("<tr><td>"));
+        c.print(cl.ip);
+        c.print(F("</td><td>"));
+        c.print(cl.port);
+        c.print(F("</td><td>"));
+        c.print((now - cl.lastActMs) / 1000);
+        c.print(F("s ago</td><td>"));
+        c.print(cl.progMode ? F("yes") : F("no"));
+        c.print(F("</td></tr>"));
+    }
+    if (!any) c.print(F("<tr><td colspan='4'>None</td></tr>"));
+    c.print(F("</table></fieldset>"));
     _shellClose(c);
 }
 
@@ -659,6 +747,32 @@ void Webserver::_panelLnTcp(EthernetClient& c) {
     _printField(c, "lntcp.enable", "Enabled");
     _printField(c, "lntcp.port",   "TCP port");
     c.print(F("</fieldset><button class='btn'>Save</button></form>"));
+
+    // Status: which clients are currently connected. No idle-timeout
+    // exists for this protocol (see ln_tcp.h's own comment on
+    // connectedMs), so this shows connection duration and detected
+    // protocol variant rather than a "last seen" idle time.
+    c.print(F("<fieldset><legend>Active Clients</legend><table>"
+              "<tr><th>IP</th><th>Port</th><th>Protocol</th><th>Connected</th></tr>"));
+    uint32_t now = millis();
+    bool any = false;
+    for (uint8_t i = 0; i < LN_TCP_MAX_CLIENTS; i++) {
+        const LnTcpClient& cl = gLnTcp.clientAt(i);
+        if (!cl.active) continue;
+        any = true;
+        c.print(F("<tr><td>"));
+        c.print(cl.ip);
+        c.print(F("</td><td>"));
+        c.print(cl.port);
+        c.print(F("</td><td>"));
+        c.print(cl.protocol == LnTcpProtocol::RAW   ? F("RAW")   :
+                 cl.protocol == LnTcpProtocol::ASCII ? F("ASCII") : F("unknown"));
+        c.print(F("</td><td>"));
+        c.print((now - cl.connectedMs) / 1000);
+        c.print(F("s</td></tr>"));
+    }
+    if (!any) c.print(F("<tr><td colspan='4'>None</td></tr>"));
+    c.print(F("</table></fieldset>"));
     _shellClose(c);
 }
 
@@ -717,6 +831,13 @@ void Webserver::_panelWebIf(EthernetClient& c) {
     c.print(F("<fieldset><legend>HTTP Server</legend>"));
     _printField(c, "web.enable", "Enabled");
     _printField(c, "web.port",   "HTTP port");
+    c.print(F("</fieldset>"
+              "<fieldset><legend>Auto-refresh</legend>"
+              "<p class='hint'>Applies to the Locomotives, Turnouts, "
+              "Feedback and LocoNet Slots panels — each reloads itself "
+              "automatically at this interval so the tables stay live. "
+              "Set to 0 to disable.</p>"));
+    _printField(c, "web.refresh_sec", "Interval (seconds, 0=off)");
     c.print(F("</fieldset>"
               "<button class='btn'>Save</button>"
               "<button class='btn bs' type='button'"
@@ -817,7 +938,7 @@ void Webserver::_panelDccHal(EthernetClient& c) {
 
     c.print(F("<h3>H-bridge status</h3>"
               "<table><tr><th>Bridge</th><th>nFAULT</th>"
-              "<th>ACK state</th><th>SENSE reading</th></tr>"));
+              "<th>ACK state</th><th>SENSE (mV)</th><th>SENSE (raw ADC)</th></tr>"));
     struct BridgeRow { const HBridgeFault* fault; const DccCurrentMonitor* sense; };
     BridgeRow rows[] = {
         { &gDccHal.faultDcc(), &gDccHal.senseDcc() },
@@ -829,6 +950,7 @@ void Webserver::_panelDccHal(EthernetClient& c) {
         c.print(F("</td><td>"));
         c.print(row.fault->isFaulted() ? F("FAULT") : F("ok"));
         c.print(F("</td><td>")); c.print(_ackStateName(row.sense->ackState()));
+        c.print(F("</td><td>")); c.print(row.sense->lastMv());
         c.print(F("</td><td>")); c.print(row.sense->lastAdcValue());
         c.print(F("</td></tr>"));
     }
@@ -848,7 +970,18 @@ void Webserver::_panelDccHal(EthernetClient& c) {
 void Webserver::_panelPower(EthernetClient& c) {
     _shellOpen(c, "power", "Power rails");
     c.print(F("<h2>Power rails</h2>"
-              "<table><tr><th>Rail</th><th>Gemeten (over weerstand)</th>"
+              "<form method='POST' action='/config'>"
+              "<input type='hidden' name='_p' value='power'>"));
+    c.print(F("<fieldset><legend>ADC Calibration</legend>"
+              "<p class='hint'>The RP2350's own ADC reference voltage "
+              "(nominally 3300mV, i.e. its 3V3 rail), as actually "
+              "measured on this board with a multimeter. This is what "
+              "every rail reading below is scaled from, so getting it "
+              "right here corrects all three readings at once.</p>"));
+    _printField(c, "pwr.vref_mv", "ADC reference voltage (mV)");
+    c.print(F("</fieldset><button class='btn'>Save</button></form>"));
+
+    c.print(F("<table><tr><th>Rail</th><th>Gemeten (over weerstand)</th>"
               "<th>Gereconstrueerd (rail)</th><th>Nominaal</th></tr>"));
 
     const PowerRailMonitor* rails[] = {
@@ -904,6 +1037,17 @@ void Webserver::_panelRsBus(EthernetClient& c) {
               "on the physical bus), which previously required a full "
               "command-station reset to recover from. Set to 0 to disable.</p>"));
     _printField(c, "rsbus.watchdog_s", "Watchdog timeout (seconds)");
+    c.print(F("</fieldset>"
+              "<fieldset><legend>Power on/off behaviour</legend>"
+              "<p class='hint'>RS-Bus feedback decoders normally have their "
+              "own power supply (or are powered via the RS-Bus itself), so "
+              "a DCC track power cycle does not physically reset them — by "
+              "default their last-known state is kept and simply shown "
+              "as-is. Enable this to instead clear the feedback table "
+              "whenever track power is switched off, so every session "
+              "starts from a known-empty state (each module then "
+              "reappears naturally as it reports in again).</p>"));
+    _printField(c, "rsbus.clear_on_power", "Clear feedback table on power off");
     c.print(F("</fieldset><button class='btn'>Save</button></form>"));
     _shellClose(c);
 }
@@ -919,6 +1063,7 @@ void Webserver::_panelRsBus(EthernetClient& c) {
 // ─────────────────────────────────────────────────────────────
 void Webserver::_panelLocos(EthernetClient& c) {
     _shellOpen(c, "locos", "Locomotives");
+    _autoRefresh(c, eepromStore().getUint16("web.refresh_sec", 4));
     c.print(F("<h2>Locomotives</h2>"
               "<table><tr>"
               "<th>Address</th><th>Speed</th><th>Direction</th>"
@@ -982,6 +1127,7 @@ void Webserver::_panelLocos(EthernetClient& c) {
 // ─────────────────────────────────────────────────────────────
 void Webserver::_panelLoconet(EthernetClient& c) {
     _shellOpen(c, "loconet", "LocoNet Slots");
+    _autoRefresh(c, eepromStore().getUint16("web.refresh_sec", 4));
     c.print(F("<h2>LocoNet Slots</h2>"
               "<p class='hint'>Only locos currently holding a LocoNet slot "
               "are shown here (i.e. touched by a LocoNet throttle such as "
@@ -1067,6 +1213,7 @@ void Webserver::_panelLoconet(EthernetClient& c) {
 // ─────────────────────────────────────────────────────────────
 void Webserver::_panelTurnouts(EthernetClient& c) {
     _shellOpen(c, "turnouts", "Turnouts");
+    _autoRefresh(c, eepromStore().getUint16("web.refresh_sec", 4));
     c.print(F("<h2>Turnouts</h2>"
               "<table><tr><th>Address</th><th>Position</th></tr>"));
     for (uint16_t i = 1; i < MAX_ACCESSORIES; i++) {
@@ -1099,6 +1246,7 @@ void Webserver::_panelTurnouts(EthernetClient& c) {
 // ─────────────────────────────────────────────────────────────
 void Webserver::_panelFeedback(EthernetClient& c) {
     _shellOpen(c, "feedback", "Feedback");
+    _autoRefresh(c, eepromStore().getUint16("web.refresh_sec", 4));
     c.print(F("<h2>RS-Bus Feedback</h2>"
               "<p class='hint'>Module = RS-Bus hardware address (1-128, as "
               "configured on the decoder). This is not the same as the "

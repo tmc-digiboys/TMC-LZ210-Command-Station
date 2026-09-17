@@ -69,7 +69,26 @@ namespace Z21Hdr {
 void Z21Lan::begin() {
     uint16_t port = eepromStore().getUint16("z21.port", Z21_PORT);
     _udp.begin(port);
-    memset(_clients, 0, sizeof(_clients));
+    // NOTE (was `memset(_clients, 0, sizeof(_clients));`): Z21Client
+    // contains an IPAddress member, which — like every Arduino
+    // Ethernet-library IPAddress — inherits Printable and so carries a
+    // vtable pointer. memset()-ing raw bytes over a C++ object with a
+    // vtable zeroes that pointer without ever re-running its
+    // constructor, so every slot's `ip` silently loses its vtable at
+    // boot. A later `_clients[i].ip = someIp;` (in _findOrAddClient())
+    // only copies the underlying address bytes — assignment never
+    // restores a vtable pointer — so the corruption persists for the
+    // client's entire lifetime. The next `c.print(cl.ip)` (web
+    // interface's own "Active Clients" table) then dispatches
+    // IPAddress::printTo() through that null vtable pointer, which
+    // hangs/crashes the request (confirmed: the web panel loads fine
+    // with zero active clients, but hangs the instant a real client is
+    // registered and its IP needs to be printed). Per-field assignment
+    // here re-runs each member's real constructor instead, so no
+    // vtable is ever destroyed.
+    for (uint8_t i = 0; i < Z21_MAX_CLIENTS; i++) {
+        _clients[i] = Z21Client();
+    }
     _clientCount = 0;
 
     EventBus::instance().registerHandler(ModuleId::Z21_LAN,
@@ -591,7 +610,7 @@ void Z21Lan::_handleGetLocoInfo(Z21Client& c, const uint8_t* data, uint8_t len) 
 // resulting state change is reported back via the shared handler's
 // broadcast mechanism once DccHal/LocoRepository have processed it.
 // ─────────────────────────────────────────────────────────────
-void Z21Lan::_handleLocoSpeed(Z21Client& c, const uint8_t* data, uint8_t len) {
+void Z21Lan::_handleLocoSpeed(Z21Client& /*c*/, const uint8_t* data, uint8_t len) {
     if (len < 3) return;
     Command cmd{};
     cmd.type     = CmdType::LOCO_SPEED;
@@ -609,7 +628,7 @@ void Z21Lan::_handleLocoSpeed(Z21Client& c, const uint8_t* data, uint8_t len) {
 // from the payload, and dispatches a LOCO_FUNCTION command onto the
 // command bus.
 // ─────────────────────────────────────────────────────────────
-void Z21Lan::_handleLocoFunction(Z21Client& c, const uint8_t* data, uint8_t len) {
+void Z21Lan::_handleLocoFunction(Z21Client& /*c*/, const uint8_t* data, uint8_t len) {
     if (len < 4) return;
     Command cmd{};
     cmd.type     = CmdType::LOCO_FUNCTION;
@@ -626,7 +645,7 @@ void Z21Lan::_handleLocoFunction(Z21Client& c, const uint8_t* data, uint8_t len)
 // numbering used internally by adding 1) and dispatches a CV_READ
 // command (service-mode programming) onto the command bus.
 // ─────────────────────────────────────────────────────────────
-void Z21Lan::_handleCvRead(Z21Client& c, const uint8_t* data, uint8_t len) {
+void Z21Lan::_handleCvRead(Z21Client& /*c*/, const uint8_t* data, uint8_t len) {
     if (len < 2) return;
     Command cmd{};
     cmd.type = CmdType::CV_READ; cmd.sourceId = ModuleId::Z21_LAN;
@@ -639,7 +658,7 @@ void Z21Lan::_handleCvRead(Z21Client& c, const uint8_t* data, uint8_t len) {
 // and value to write, and dispatches a CV_WRITE command (service-mode
 // programming) onto the command bus.
 // ─────────────────────────────────────────────────────────────
-void Z21Lan::_handleCvWrite(Z21Client& c, const uint8_t* data, uint8_t len) {
+void Z21Lan::_handleCvWrite(Z21Client& /*c*/, const uint8_t* data, uint8_t len) {
     if (len < 3) return;
     Command cmd{};
     cmd.type    = CmdType::CV_WRITE; cmd.sourceId = ModuleId::Z21_LAN;
@@ -658,7 +677,7 @@ void Z21Lan::_handleCvWrite(Z21Client& c, const uint8_t* data, uint8_t len) {
 // LN_DISPATCH command onto the command bus, requesting that this
 // address be dispatched for use on the LocoNet side.
 // ─────────────────────────────────────────────────────────────
-void Z21Lan::_handleLocoNetDispatch(Z21Client& c, const uint8_t* data, uint8_t len) {
+void Z21Lan::_handleLocoNetDispatch(Z21Client& /*c*/, const uint8_t* data, uint8_t len) {
     if (len < 2) return;
     uint16_t addr = ((uint16_t)data[0] << 8) | data[1];
     Command cmd{};
@@ -728,7 +747,7 @@ void Z21Lan::_handleRmbusGetData(Z21Client& c, const uint8_t* data, uint8_t len)
 //  data=nullptr, len=0) as the common "send back the current time" tail
 //  end of every fast-clock control sub-command in _handleFastClockSet().
 // ─────────────────────────────────────────────────────────────
-void Z21Lan::_handleFastClockGet(Z21Client& c, const uint8_t* data, uint8_t len) {
+void Z21Lan::_handleFastClockGet(Z21Client& c, const uint8_t* /*data*/, uint8_t /*len*/) {
     uint8_t dow    = gCentrale.mtDow    & 0x07;
     uint8_t hour   = gCentrale.mtHour   & 0x1F;
     uint8_t minute = gCentrale.mtMinute & 0x3F;
@@ -973,7 +992,7 @@ void Z21Lan::_handleGetLocoMode(Z21Client& c, const uint8_t* data, uint8_t len) 
 // that address's AccessoryState entry, if the address is within
 // range. Per spec, no reply is sent for this command.
 // ─────────────────────────────────────────────────────────────
-void Z21Lan::_handleSetTurnoutMode(Z21Client& c, const uint8_t* data, uint8_t len) {
+void Z21Lan::_handleSetTurnoutMode(Z21Client& /*c*/, const uint8_t* data, uint8_t len) {
     // LAN_SET_TURNOUTMODE — no response per spec
     if (len < 3) return;
     uint16_t addr = ((uint16_t)data[0] << 8) | data[1];

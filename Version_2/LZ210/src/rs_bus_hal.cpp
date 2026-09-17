@@ -103,7 +103,15 @@ void RsBusHal::begin() {
 //             broadcast — see below for why this must NOT be done
 //             as an immediate, synchronous dump here instead.
 //  POWER_OFF: stops the RS-Bus master gracefully (waits for the end
-//             of the current cycle).
+//             of the current cycle). If "rsbus.clear_on_power" is
+//             enabled, also wipes the feedback table (clearAll())
+//             right here — see that EEPROM key's own comment and
+//             the web interface's RS-Bus panel for the rationale.
+//             Deliberately done on POWER_OFF rather than POWER_ON:
+//             clearing here means the table is already empty by the
+//             time POWER_ON's own sentinel-reset logic (above) takes
+//             over, rather than needing a second, separate clear at
+//             power-on that could race with it.
 // ─────────────────────────────────────────────────────────────
 void RsBusHal::onEvent(const Event& ev) {
     if (ev.type == EvType::POWER_ON) {
@@ -117,7 +125,9 @@ void RsBusHal::onEvent(const Event& ev) {
         // powered via the RS-Bus itself) — a DCC power cycle does not
         // reset them, so whatever the library still has recorded remains
         // the best information available (also read directly by the web
-        // interface's live feedback table).
+        // interface's live feedback table), UNLESS the operator has opted
+        // into "rsbus.clear_on_power" — in which case it was already
+        // wiped when POWER_OFF fired, see below.
         //
         // Reset our own delta cache to a sentinel that can never match a
         // real nibble value (0-15), so that the first report received
@@ -135,6 +145,11 @@ void RsBusHal::onEvent(const Event& ev) {
         traceLog().logf(TraceLevel::INFO, TraceSource::RS_BUS, "power-off -> RS-Bus stop");
         rsBus.stop();
         _powered = false;
+        if (eepromStore().getBool("rsbus.clear_on_power", false)) {
+            traceLog().logf(TraceLevel::INFO, TraceSource::RS_BUS,
+                             "rsbus.clear_on_power -> clearing feedback table");
+            clearAll();
+        }
     }
 }
 

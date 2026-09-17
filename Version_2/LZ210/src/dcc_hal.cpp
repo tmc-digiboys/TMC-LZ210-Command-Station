@@ -28,6 +28,7 @@
 #include "oled_display.h"
 #include "eeprom_store.h"
 #include "led_status.h"
+#include "hardware/gpio.h"  // gpio_disable_pulls() — see begin()'s _pinCde setup
 #include "xpressnet_handler.h"  // for gCentrale (trackPowerOff/emergencyStop)
 
 // Global instance used by all modules and the notify callbacks
@@ -104,6 +105,12 @@ void DccHal::_checkCdeShort() {
     // up to detect a short circuit from in the first place.
     if (!eepromStore().getBool("sys.cde_enable", true)) return;
 
+    // Startup grace period — see CDE_STARTUP_GRACE_MS's comment in
+    // dcc_hal.h. Skip the check entirely until the booster has had
+    // time to lock onto the DCC signal after power-on.
+    uint32_t graceMs = eepromStore().getUint16("sys.cde_grace_ms", CDE_STARTUP_GRACE_MS);
+    if ((millis() - _powerOnMs) < graceMs) return;
+
     // Multiple throwaway reads, not just one — this specific node has a
     // notably high source impedance (~34K Thevenin, via R704/R705),
     // and the RP2350's ADC sample-and-hold capacitor needs more than a
@@ -171,7 +178,7 @@ void DccHal::_checkCdeShort() {
     if (mode == 1) return;
 
     // Mode 0: turn the station off
-    traceSerial.printf("[%lu] CDE kortsluit gedetecteerd (mv=%u) — power off\n", millis(), mv);
+    traceSerial.printf("[%lu] CDE shortCircuit detected (mv=%u) — power off\n", millis(), mv);
     gCentrale.trackPowerOff = true;
     gCentrale.emergencyStop = false;
     gCentrale.shortCircuit  = true;
@@ -202,7 +209,7 @@ void DccHal::_checkCdeShort() {
 void DccHal::_checkHBridgeFault(HBridgeFault& fb) {
     if (!_power) return;  // already off, nothing to do
 
-    traceSerial.printf("[%lu] H-brug fault (%s) gedetecteerd — power off\n",
+    traceSerial.printf("[%lu] H-brug fault (%s) detected — power off\n",
                    millis(), fb.name());
     gCentrale.trackPowerOff = true;
     gCentrale.emergencyStop = false;
@@ -227,15 +234,26 @@ void DccHal::_checkHBridgeFault(HBridgeFault& fb) {
 //  notify callbacks and the CommandBus handler (which cannot carry a
 //  real `this` pointer) can still reach the instance's state.
 //
-//  _pinCde (the CDE booster E-signal input) needs no pinMode()/
-//  attachInterrupt() setup here — it is read via analogRead() in
-//  _checkCdeShort() (polled every loop() iteration), which configures
-//  the pin for ADC use internally. See CDE_SHORT_MV's comment in
-//  dcc_hal.h for why this replaced an earlier digital, interrupt-
+//  _pinCde (the CDE booster E-signal input, GP41) is read via
+//  analogRead() in _checkCdeShort() (polled every loop() iteration),
+//  which configures the pin for ADC use internally — no pinMode()/
+//  attachInterrupt() needed for that part. See CDE_SHORT_MV's comment
+//  in dcc_hal.h for why this replaced an earlier digital, interrupt-
 //  driven approach entirely: the E-signal's fault voltage (~1.8-1.9V)
 //  turned out to sit inside the RP2350's undefined digital input
 //  region, which digitalRead() could not reliably distinguish from
-//  normal operation regardless of timing/debounce tuning. (Note: GP4/
+//  normal operation regardless of timing/debounce tuning.
+//
+//  gpio_disable_pulls(_pinCde) IS still needed here, though, and is
+//  new as of this hardware revision: the RP2350B/Olimex board's core
+//  library apparently enables an internal pull-up by default on the
+//  higher-numbered GPIOs (this pin's bank) — a pull-up left enabled on
+//  an ADC input pin biases every analogRead() sample upward toward
+//  3.3V, which would corrupt exactly the millivolt-threshold
+//  comparison _checkCdeShort() depends on. Called once here, before
+//  the first analogRead() in loop(), rather than repeatedly in
+//  _checkCdeShort() itself, since the pad's pull configuration is not
+//  expected to reset itself between reads. (Note: GP4/
 //  _pinEn is deliberately NOT configured as a manual enable pin on
 //  this hardware revision — see setPower() and the
 //  enable_additional_DCC_output() call below for how it is actually
@@ -274,6 +292,13 @@ void DccHal::begin() {
     pinMode(HW_SM_ACTIVE,  OUTPUT); digitalWrite(HW_SM_ACTIVE,  LOW);
     _serviceModeRequested = false;
     _serviceModeStartMs   = 0;
+
+    // See begin()'s own comment above (_pinCde section) for why this
+    // is needed: disables both the pull-up the RP2350B/Olimex core
+    // library apparently enables by default on this pin, and any
+    // pull-down, leaving the pin fully floating for analogRead() in
+    // _checkCdeShort() to measure the true E-signal voltage.
+    gpio_disable_pulls(_pinCde);
 
     // v2 hardware: the three onboard H-bridges' low-active nFAULT
     // pins (short-circuit/overcurrent detection).
@@ -441,20 +466,36 @@ void DccHal::loop() {
     // that check alone was in place), so checkDuration() catches it
     // independently via raw continuous-low time instead. An isolated
     // blip is logged but triggers neither escalation path. All
-    // thresholds are EEPROM-configurable (web interface), shared
-    // across all three bridges rather than per-bridge, to keep this
-    // one tunable policy rather than three separate ones.
-    uint32_t faultWindowMs   = eepromStore().getUint32("sys.fault_window_ms", 1000);
-    uint8_t  faultRetryCnt   = eepromStore().getUint8("sys.fault_retry_count", 3);
-    uint32_t faultDurationMs = eepromStore().getUint32("sys.fault_duration_ms", 50);
-    // Recovery-confirm debounce for checkDuration() below — same
-    // reasoning as CDE_CLEAR_US (dcc_hal.h)/"sys.cde_clear_us": a
-    // storm of closely-spaced fault blips (Rob, TraceLog: a ~2-second
-    // run of individual "fault edge" events with no escalation at
-    // all) needs the pin to read genuinely HIGH for at least this long
-    // before checkDuration() treats it as recovered, rather than
-    // resetting on the very first HIGH sample caught between blips.
-    uint32_t faultClearMs    = eepromStore().getUint32("sys.fault_clear_ms", 10);
+    // thresholds are EEPROM-configurable (web interface), PER BRIDGE
+    // (dcc/sm/cde) — requested by Rob so e.g. the CDE bridge (a
+    // different chip variant, DRV8876 vs the DCC bridge's DRV8874 —
+    // same reasoning as the per-bridge ACK-threshold fields) can be
+    // tuned independently if its retry timing differs.
+    struct FaultParams { uint32_t windowMs, durationMs, clearMs; uint8_t retryCount; };
+    auto faultParams = [](const char* prefix) {
+        char key[24];
+        FaultParams p;
+        snprintf(key, sizeof(key), "%s.fault_window_ms", prefix);
+        p.windowMs   = eepromStore().getUint32(key, 1000);
+        snprintf(key, sizeof(key), "%s.fault_retry_count", prefix);
+        p.retryCount = eepromStore().getUint8(key, 3);
+        snprintf(key, sizeof(key), "%s.fault_duration_ms", prefix);
+        p.durationMs = eepromStore().getUint32(key, 50);
+        // Recovery-confirm debounce for checkDuration() below — same
+        // reasoning as CDE_CLEAR_US (dcc_hal.h)/"sys.cde_clear_us": a
+        // storm of closely-spaced fault blips (Rob, TraceLog: a
+        // ~2-second run of individual "fault edge" events with no
+        // escalation at all) needs the pin to read genuinely HIGH for
+        // at least this long before checkDuration() treats it as
+        // recovered, rather than resetting on the very first HIGH
+        // sample caught between blips.
+        snprintf(key, sizeof(key), "%s.fault_clear_ms", prefix);
+        p.clearMs    = eepromStore().getUint32(key, 10);
+        return p;
+    };
+    FaultParams dccParams = faultParams("dcc");
+    FaultParams smParams  = faultParams("sm");
+    FaultParams cdeParams = faultParams("cde");
 
     // check() must be captured once per bridge and reused as the gate
     // for shouldEscalate() below (not called again/separately) —
@@ -483,29 +524,29 @@ void DccHal::loop() {
     if (smEdge)  traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultSm.name());
     if (cdeEdge) traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultCde.name());
 
-    if (dccEdge && _faultDcc.shouldEscalate(faultWindowMs, faultRetryCnt)) {
+    if (dccEdge && _faultDcc.shouldEscalate(dccParams.windowMs, dccParams.retryCount)) {
         traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count within window)", _faultDcc.name());
         _checkHBridgeFault(_faultDcc);
     }
-    if (_faultDcc.checkDuration(faultDurationMs, faultClearMs)) {
+    if (_faultDcc.checkDuration(dccParams.durationMs, dccParams.clearMs)) {
         traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultDcc.name());
         _checkHBridgeFault(_faultDcc);
     }
 
-    if (smEdge && _faultSm.shouldEscalate(faultWindowMs, faultRetryCnt)) {
+    if (smEdge && _faultSm.shouldEscalate(smParams.windowMs, smParams.retryCount)) {
         traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count within window)", _faultSm.name());
         _checkHBridgeFault(_faultSm);
     }
-    if (_faultSm.checkDuration(faultDurationMs, faultClearMs)) {
+    if (_faultSm.checkDuration(smParams.durationMs, smParams.clearMs)) {
         traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultSm.name());
         _checkHBridgeFault(_faultSm);
     }
 
-    if (cdeEdge && _faultCde.shouldEscalate(faultWindowMs, faultRetryCnt)) {
+    if (cdeEdge && _faultCde.shouldEscalate(cdeParams.windowMs, cdeParams.retryCount)) {
         traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count within window)", _faultCde.name());
         _checkHBridgeFault(_faultCde);
     }
-    if (_faultCde.checkDuration(faultDurationMs, faultClearMs)) {
+    if (_faultCde.checkDuration(cdeParams.durationMs, cdeParams.clearMs)) {
         traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultCde.name());
         _checkHBridgeFault(_faultCde);
     }
@@ -656,6 +697,14 @@ void DccHal::_exitServiceMode(bool ok, uint16_t cv, uint8_t value) {
 // ─────────────────────────────────────────────────────────────
 void DccHal::setPower(bool on) {
     _power = on;
+    _inEmergencyStop = false;  // any real power cycle supersedes an emergency-stop LED state
+    if (on) {
+        // Start of _checkCdeShort()'s startup grace period — see
+        // CDE_STARTUP_GRACE_MS's comment in dcc_hal.h.
+        _powerOnMs         = millis();
+        _cdeFaultSinceUs   = 0;  // don't let a stale fault window from
+        _cdeRecoverSinceUs = 0;  // before this power-on carry over into it
+    }
     // _dcc.setpower(..., true) already calls notifyRailpower() itself
     // (synchronously — see DCCPacketScheduler::setpower() in the
     // library), which in turn publishes the EventBus event. An extra
@@ -680,10 +729,23 @@ void DccHal::setPower(bool on) {
 //
 //  Sends the DCC broadcast emergency stop packet and publishes
 //  an EMERGENCY_STOP event so protocol modules can inform clients.
+//  Deliberately does NOT touch _power/setPower() — track power stays
+//  on, only the locos are told to stop (see CmdType::EMERGENCY_STOP's
+//  handling in _onCommand()). Switches the status LED to its distinct
+//  emergency-stop blink (see LedStatus::onEmergencyStop()'s comment)
+//  so this is visually distinguishable from a genuine power-off.
 // ─────────────────────────────────────────────────────────────
 void DccHal::emergencyStop() {
+    // Track power itself is unaffected by an emergency stop — the DCC
+    // signal keeps running (see the DCCInterfaceMaster-TMC library's
+    // own ESTOP definition and setpower(): "no Loco drive but rails
+    // have power"). The library itself now correctly excludes ESTOP
+    // from its notifyRailpower() callback for exactly that reason —
+    // no suppression needed on this side of that boundary any more.
     _dcc.eStop();
     EventBus::instance().publish(Ev::estop(ModuleId::DCC_HAL));
+    _inEmergencyStop = true;
+    gLeds.onEmergencyStop();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -747,6 +809,24 @@ uint8_t DccHal::_scaleSpeed(uint8_t speed, uint8_t mode) {
 // ─────────────────────────────────────────────────────────────
 void DccHal::setSpeed(uint16_t addr, uint8_t speed, bool fwd, uint8_t mode) {
     if (!_power) return;   // don't send DCC packets while power is off
+
+    // Clear the emergency-stop LED indication (see
+    // LedStatus::onEmergencyStop()'s comment) once operation actually
+    // resumes — signalled by the next genuine speed command, since
+    // XpressNet itself has no separate explicit "resume" command.
+    // Deliberately gated on _inEmergencyStop rather than restoring the
+    // LED on every speed command unconditionally: this function runs
+    // on essentially every throttle movement, and touching
+    // power/LED-related state on every single one of those — rather
+    // than only the specific transition out of an actual emergency
+    // stop — is exactly the kind of over-broad trigger that caused
+    // trouble before (see setPower()'s own comment on the double-
+    // publish bug for a related example of that failure mode).
+    if (_inEmergencyStop) {
+        _inEmergencyStop = false;
+        gLeds.onPowerOnClear();
+    }
+
     uint8_t scaled;
     switch (mode) {
         case 0:  scaled = _scaleSpeed(speed, 0); break;  // 14 steps

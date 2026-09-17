@@ -107,7 +107,7 @@ void LenzLan::begin() {
     }
     _connCount = 0;
 
-    traceSerial.printf("LenzLan: server gestart op poort %u\n", port);
+    traceSerial.printf("LenzLan: server started on port %u\n", port);
 
     // Broadcast callback: the XpressNet handler calls this
     // synchronously from within command processing (e.g. turnout info
@@ -199,7 +199,7 @@ void LenzLan::_acceptNew() {
     EthernetClient newClient = _server->accept();
     if (!newClient) return;
 
-    traceSerial.print("LenzLan: nieuwe client van ");
+    traceSerial.print("LenzLan: new client from ");
     traceSerial.println(newClient.remoteIP());
 
     int8_t slot = -1;
@@ -210,6 +210,8 @@ void LenzLan::_acceptNew() {
     if (slot < 0) { newClient.stop(); return; }
 
     _clients[slot].tcp       = newClient;
+    _clients[slot].ip        = newClient.remoteIP();
+    _clients[slot].port      = newClient.remotePort();
     _clients[slot].rxLen     = 0;
     _clients[slot].progMode  = false;
     _clients[slot].lastActMs = millis();
@@ -330,7 +332,7 @@ void LenzLan::_acceptNew() {
 // ─────────────────────────────────────────────────────────────
 void LenzLan::_processClient(LenzClient& c) {
     if (!c.tcp.connected() && !c.tcp.available()) {
-        traceSerial.println("LenzLan: client verbroken");
+        traceSerial.println("LenzLan: client disconnected");
         c.tcp.stop();
         c.active   = false;
         c.progMode = false;
@@ -343,7 +345,7 @@ void LenzLan::_processClient(LenzClient& c) {
 
     // Buffer overflow: buffer full but the client still has more to send.
     if (c.rxLen >= LENZ_LAN_RX_BUF && c.tcp.available()) {
-        traceSerial.println("LenzLan: buffer-overflow, herstel...");
+        traceSerial.println("LenzLan: buffer-overflow, recovery...");
         uint8_t err[3];
         uint8_t errLen = XnInterfaceLayer::buildBufferOverflowError(err);
         XnFrame f; memcpy(f.data, err, errLen); f.len = errLen; f.isBroadcast = false;
@@ -379,7 +381,7 @@ void LenzLan::_processClient(LenzClient& c) {
     } else {
         if (c.frameStartMs == 0) c.frameStartMs = millis();
         else if (millis() - c.frameStartMs > LENZ_LAN_FRAME_TIMEOUT_MS) {
-            traceSerial.println("LenzLan: onvolledig frame timeout");
+            traceSerial.println("LenzLan: incomplete frame timeout");
             uint8_t err[3];
             uint8_t errLen = XnInterfaceLayer::buildFrameTimeoutError(err);
             XnFrame f; memcpy(f.data, err, errLen); f.len = errLen; f.isBroadcast = false;

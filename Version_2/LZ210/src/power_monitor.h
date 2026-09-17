@@ -24,17 +24,34 @@
 //  expected and normal, reflecting real-world resistor tolerance
 //  (typically ±5%) rather than indicating a fault.
 //
-//  Checked once at boot (begin(), logged to Serial2) and continuously
+//  Checked once at boot (begin(), logged to TraceSerial) and continuously
 //  thereafter (loop(), once per instance from PowerMonitor::loop()),
 //  with both the measured (across-resistor) and reconstructed (full
 //  rail) voltages readable live via the web interface.
+//
+//  The ADC's own reference voltage (nominally 3.300V, i.e. the RP2350's
+//  3V3 rail) is read live from EEPROM ("pwr.vref_mv", web interface —
+//  see the Power rails panel) rather than assumed fixed, since the
+//  real 3V3 rail varies board-to-board within the regulator's own
+//  tolerance and this assumption scales every reconstructed rail
+//  voltage proportionally. Measure the actual 3V3 rail with a
+//  multimeter and set this to match for accurate readings.
 // ═══════════════════════════════════════════════════════════════
 #include <Arduino.h>
 #include "module_arch.h"
 #include "hardware_config.h"
+#include "eeprom_store.h"
+#include "trace_log.h"
 
 #define PWR_ADC_MAX      4095  // RP2350 ADC full scale (12-bit)
-#define PWR_ADC_VREF_MV  3300  // RP2350 ADC reference voltage (mV)
+// Default/fallback ADC reference voltage (mV) — only used if
+// "pwr.vref_mv" (see LZ210.ino's own registerUint16 comment) is
+// somehow unregistered. In normal operation the actual value comes
+// from EEPROM, since the real 3V3 rail varies board-to-board within
+// the regulator's tolerance and this assumption's accuracy directly
+// scales every reconstructed rail voltage (Rob measured 3230mV vs.
+// the nominal 3300 on his own board).
+#define PWR_ADC_VREF_MV  3300
 
 // ─────────────────────────────────────────────────────────────
 //  PowerRailMonitor — reads one ADC-capable pin (the voltage across
@@ -66,17 +83,23 @@ public:
     void begin() {
         analogReadResolution(12);
         loop();
-        Serial2.printf("PowerMonitor: %s gemeten=%umV rail=%umV (nominaal %umV)\n",
+        traceSerial.printf("PowerMonitor: %s measured=%umV rail=%umV (nominal %umV)\n",
                        _name, _measuredMv, _railMv, _nominalMv);
     }
 
     // Call every loop() iteration. Reads the ADC, converts to
     // millivolts (the voltage actually across the lower resistor),
     // then reconstructs the full rail voltage from the exact divider
-    // ratio.
+    // ratio. The reference voltage is read live from EEPROM
+    // ("pwr.vref_mv", per-board calibrated against the actual 3V3
+    // rail) each call — same pattern as other web-configurable
+    // settings in this project (e.g. Z21Lan::_checkTimeouts()) — so a
+    // calibration change via the web interface takes effect
+    // immediately, without needing a reboot.
     void loop() {
         uint16_t raw = (uint16_t)analogRead(_pin);
-        _measuredMv = (uint16_t)(((uint32_t)raw * PWR_ADC_VREF_MV) / PWR_ADC_MAX);
+        uint16_t vrefMv = eepromStore().getUint16("pwr.vref_mv", PWR_ADC_VREF_MV);
+        _measuredMv = (uint16_t)(((uint32_t)raw * vrefMv) / PWR_ADC_MAX);
         _railMv = (uint16_t)(((uint32_t)_measuredMv * (_rSeriesOhm + _rMeasureOhm))
                               / _rMeasureOhm);
     }

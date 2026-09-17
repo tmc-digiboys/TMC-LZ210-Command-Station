@@ -640,7 +640,7 @@ void SlotServer::_handleSlotStat1(LocoNetDispatcher& dispatcher,
 // OPC_GPON. Track power on/off only ever happens via an explicit user
 // action (web/XpressNet/USB) or a genuine OPC_GPON message on the
 // bus — see _handleGpOn().
-void SlotServer::_handleLocoSpd(LocoNetDispatcher& dispatcher,
+void SlotServer::_handleLocoSpd(LocoNetDispatcher& /*dispatcher*/,
                                   const LnMsg* pkt)
 {
     uint8_t slot = pkt->lsp.slot;
@@ -662,7 +662,7 @@ void SlotServer::_handleLocoSpd(LocoNetDispatcher& dispatcher,
 // acts if the slot is found and currently IN_USE. Applies the new
 // direction/F0-F4 state via _writeDirf() and publishes a LOCO_STATE
 // event.
-void SlotServer::_handleLocoDirf(LocoNetDispatcher& dispatcher,
+void SlotServer::_handleLocoDirf(LocoNetDispatcher& /*dispatcher*/,
                                    const LnMsg* pkt)
 {
     uint8_t slot = pkt->ldf.slot;
@@ -682,7 +682,7 @@ void SlotServer::_handleLocoDirf(LocoNetDispatcher& dispatcher,
 // _handleLocoSnd() — same guard pattern again: only acts if the slot
 // is found and currently IN_USE. Applies the new F5-F8 state via
 // _writeSnd() and publishes a LOCO_STATE event.
-void SlotServer::_handleLocoSnd(LocoNetDispatcher& dispatcher,
+void SlotServer::_handleLocoSnd(LocoNetDispatcher& /*dispatcher*/,
                                   const LnMsg* pkt)
 {
     uint8_t slot = pkt->ls.slot;
@@ -707,7 +707,7 @@ void SlotServer::_handleLocoSnd(LocoNetDispatcher& dispatcher,
 // F4↔bit3), while leaving every other function bit untouched. Marks
 // the loco dirty for both DCC and LocoNet resend, and publishes a
 // LOCO_STATE event.
-void SlotServer::_handleConsistFunc(LocoNetDispatcher& dispatcher,
+void SlotServer::_handleConsistFunc(LocoNetDispatcher& /*dispatcher*/,
                                      const LnMsg* pkt)
 {
     uint8_t slot = pkt->data[1];
@@ -776,7 +776,7 @@ void SlotServer::_handleUnlinkSlots(LocoNetDispatcher& dispatcher,
 //  publishes a matching ACCESSORY_STATE event so other protocol
 //  modules can inform their own clients of the change.
 // ─────────────────────────────────────────────────────────────
-void SlotServer::_handleSwReq(LocoNetDispatcher& dispatcher,
+void SlotServer::_handleSwReq(LocoNetDispatcher& /*dispatcher*/,
                                const LnMsg* pkt)
 {
     // See _lastSentSw1/2's own comment in slot_server.h: this exact
@@ -820,8 +820,8 @@ void SlotServer::_handleSwReq(LocoNetDispatcher& dispatcher,
 // _handleSwState() — OPC_SW_STATE: a query for the current state of a
 // turnout. Stubbed out: always replies with a plain success LACK
 // (ack=0x7F) without actually reporting any real turnout state.
-void SlotServer::_handleSwState(LocoNetDispatcher& dispatcher,
-                                 const LnMsg* pkt)
+void SlotServer::_handleSwState(LocoNetDispatcher& /*dispatcher*/,
+                                 const LnMsg* /*pkt*/)
 {
     LnMsg reply = makeLongAck(OPC_SW_STATE & 0x7F, 0x7F);
     _queueMsg(reply);
@@ -874,8 +874,8 @@ void SlotServer::_handleSwAck(LocoNetDispatcher& dispatcher,
 //  power), and publishes a POWER_ON event so other protocol modules
 //  can inform their own clients.
 // ─────────────────────────────────────────────────────────────
-void SlotServer::_handleGpOn(LocoNetDispatcher& dispatcher,
-                              const LnMsg* pkt)
+void SlotServer::_handleGpOn(LocoNetDispatcher& /*dispatcher*/,
+                              const LnMsg* /*pkt*/)
 {
     if (gCentrale.shortCircuit || gCentrale.trackPowerOff == false) {
         return;  // already on, or blocked — nothing to do
@@ -901,7 +901,7 @@ void SlotServer::_handleGpOn(LocoNetDispatcher& dispatcher,
 // same event RsBusHal already publishes for its own feedback bus, so
 // XpressNet/Z21 clients see this exactly like any other feedback
 // module without needing separate handling on their end.
-void SlotServer::_handleInputRep(LocoNetDispatcher& dispatcher,
+void SlotServer::_handleInputRep(LocoNetDispatcher& /*dispatcher*/,
                                   const LnMsg* pkt)
 {
     uint8_t in1 = pkt->data[1];
@@ -960,8 +960,8 @@ void SlotServer::_handleInputRep(LocoNetDispatcher& dispatcher,
 // EventBus publish happen in that case. Otherwise clears the
 // TRK_POWER_ON bit, dispatches a POWER_OFF command onto the
 // CommandBus, and publishes a POWER_OFF event.
-void SlotServer::_handleGpOff(LocoNetDispatcher& dispatcher,
-                               const LnMsg* pkt)
+void SlotServer::_handleGpOff(LocoNetDispatcher& /*dispatcher*/,
+                               const LnMsg* /*pkt*/)
 {
     if (gCentrale.trackPowerOff) {
         return;  // already off — nothing to do
@@ -980,8 +980,8 @@ void SlotServer::_handleGpOff(LocoNetDispatcher& dispatcher,
 // letting DccHal handle the actual broadcast DCC emergency stop; no
 // direct reply is sent and no event is published here (EMERGENCY_STOP
 // handling on the DCC side publishes its own event separately).
-void SlotServer::_handleIdle(LocoNetDispatcher& dispatcher,
-                              const LnMsg* pkt)
+void SlotServer::_handleIdle(LocoNetDispatcher& /*dispatcher*/,
+                              const LnMsg* /*pkt*/)
 {
     Command cmd{};
     cmd.type = CmdType::EMERGENCY_STOP;
@@ -1209,7 +1209,7 @@ void SlotServer::_fillEmptySlotMsg(LnMsg& msg, uint8_t slot) const
 // while still holding the lock, releases the lock, and then queues
 // both an OPC_BUSY message and the SL_RD_DATA message for
 // transmission (see the queuing rationale below).
-void SlotServer::_sendSlotData(LocoNetDispatcher& dispatcher, uint8_t slot)
+void SlotServer::_sendSlotData(LocoNetDispatcher& /*dispatcher*/, uint8_t slot)
 {
     if (!_repo.lockRead(500)) return;
     LocoBase* loco = _repo.findBySlot(slot);
@@ -1234,7 +1234,7 @@ void SlotServer::_sendSlotData(LocoNetDispatcher& dispatcher, uint8_t slot)
 // avoiding a redundant lookup-by-slot-number. Builds the SL_RD_DATA
 // message directly from the given entry and queues it (preceded by
 // an OPC_BUSY message) exactly as the slot-number overload does.
-void SlotServer::_sendSlotData(LocoNetDispatcher& dispatcher,
+void SlotServer::_sendSlotData(LocoNetDispatcher& /*dispatcher*/,
                                 const LocoBase* loco)
 {
     LnMsg msg;
@@ -1248,7 +1248,7 @@ void SlotServer::_sendSlotData(LocoNetDispatcher& dispatcher,
 // message (replying to the given opcode with the given ack byte,
 // typically 0x7F for success or 0x00 for failure) and queues it for
 // transmission via _queueMsg().
-void SlotServer::_sendLack(LocoNetDispatcher& dispatcher,
+void SlotServer::_sendLack(LocoNetDispatcher& /*dispatcher*/,
                             uint8_t replyToOpc, uint8_t ack)
 {
     LnMsg lack = makeLongAck(replyToOpc, ack);
@@ -1284,7 +1284,7 @@ void SlotServer::_sendLack(LocoNetDispatcher& dispatcher,
 // them from the message's func byte, refreshes the slot's last-
 // activity timestamp, marks both DCC and LocoNet dirty, and publishes
 // a LOCO_STATE event.
-void SlotServer::_handleLocoF9F12(LocoNetDispatcher& dispatcher,
+void SlotServer::_handleLocoF9F12(LocoNetDispatcher& /*dispatcher*/,
                                    const LnMsg* pkt)
 {
     uint8_t slot = pkt->data[1];

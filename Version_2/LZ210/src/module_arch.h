@@ -189,9 +189,11 @@ public:
     // Called repeatedly in the main loop on the appropriate core
     virtual void loop()  = 0;
 
-    // Optional handlers (default no-op)
-    virtual void onCommand(const Command& cmd) {}
-    virtual void onEvent(const Event& ev)      {}
+    // Optional handlers (default no-op). Parameters intentionally
+    // unnamed — this base implementation never uses them; overrides
+    // that do use them name the parameter in their own signature.
+    virtual void onCommand(const Command&) {}
+    virtual void onEvent(const Event&)     {}
 
     const char* name()    const { return _name; }
     uint8_t     id()      const { return _id; }

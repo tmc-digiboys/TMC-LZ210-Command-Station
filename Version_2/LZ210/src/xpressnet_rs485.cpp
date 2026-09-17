@@ -34,7 +34,8 @@ static const uint16_t xn_uart_tx_instructions[] = {
 };
 static const struct pio_program xn_uart_tx_prog = {
     .instructions = xn_uart_tx_instructions,
-    .length = 4, .origin = XN_TX_ORIGIN, .pio_version = 0
+    .length = 4, .origin = XN_TX_ORIGIN, .pio_version = 0,
+    .used_gpio_ranges = 0
 };
 
 #define xn_uart_rx_wrap_target 0
@@ -48,7 +49,8 @@ static const uint16_t xn_uart_rx_instructions[] = {
 };
 static const struct pio_program xn_uart_rx_prog = {
     .instructions = xn_uart_rx_instructions,
-    .length = 5, .origin = XN_RX_ORIGIN, .pio_version = 0
+    .length = 5, .origin = XN_RX_ORIGIN, .pio_version = 0,
+    .used_gpio_ranges = 0
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -207,8 +209,10 @@ void XpressNetRs485::loop() {
 // Helper function: returns true if any slaves are currently present.
 // (Note: this free function currently has no callers in this file —
 // hasSlavesPresent() below is called directly instead. Kept here in
-// case external code still expects a free-function wrapper.)
-static bool _hasPresent(const XpressNetRs485& rs) {
+// case external code still expects a free-function wrapper —
+// [[maybe_unused]] silences the resulting "defined but not used"
+// warning without removing the function.)
+[[maybe_unused]] static bool _hasPresent(const XpressNetRs485& rs) {
     return rs.hasSlavesPresent();
 }
 

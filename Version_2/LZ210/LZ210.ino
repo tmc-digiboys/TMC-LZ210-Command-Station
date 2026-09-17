@@ -15,10 +15,17 @@
 //       the CommandBus/EventBus flowing and feed the watchdog.
 //
 //  RP2350 dual-core split:
-//    Core 0: DccHal, RsBusHal, EepromStore, OledDisplay, LocoNet
-//            (all latency-sensitive DCC/LocoNet/RS-Bus hardware work)
-//    Core 1: LenzLan, LenzUsb, Z21Lan, XpressNetRs485, Webserver
-//            (all client-facing network/USB/RS-485 protocol work)
+//    Core 0: DccHal, RsBusHal, OledDisplay, PowerMonitor
+//            (all latency-sensitive DCC/RS-Bus hardware work)
+//    Core 1: LenzLan, LenzUsb, Z21Lan, XpressNetRs485, LocoNet,
+//            LnTcp, Webserver, TraceLog
+//            (all client-facing network/USB/RS-485/LocoNet protocol work)
+//    Both:   EepromStore
+//
+//  (Corrected: LocoNet actually registers itself with ModuleCore::CORE1
+//  in its own constructor — see loconet_module.h — not core0 as this
+//  comment previously claimed. Confirmed against every module's actual
+//  ModuleCore argument, not just this summary.)
 //
 //  setup()/loop() run on core0 (the Arduino-Pico core's default);
 //  setup1()/loop1() run on core1 and are started automatically by
@@ -58,7 +65,7 @@
 // EEPROM-stored values ("net.mac"/"net.ip") are missing or invalid —
 // see _loadNetworkConfig() and setup1() below.
 static byte      mac[]    = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-static IPAddress staticIp(192, 168, 54, 200);
+static IPAddress staticIp(192, 168, 0, 200);
 
 // gCore0Ready — set true at the very end of setup() (core0), after
 // every module has been registered and had begin() called on it, and
@@ -102,6 +109,21 @@ volatile bool gResetRequested   = false;
 // cores start executing concurrently and core1 must not touch the
 // UART before core0 has initialised it.
 volatile bool gSerial2Ready = false;
+
+// _bootDelay() — like delay(ms), but keeps pumping gLeds.loop() while
+// waiting, so the boot-time status LED blink (see setup()) actually
+// keeps blinking through these deliberate pauses instead of freezing
+// on whatever level it happened to be at when the pause started. Only
+// used during setup() on core0, before loop() has started (and
+// therefore before anything else is calling gLeds.loop() yet), so
+// there's no risk of this racing with core0's own loop().
+static void _bootDelay(uint32_t ms) {
+    uint32_t start = millis();
+    while (millis() - start < ms) {
+        gLeds.loop();
+        delay(5);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 //  setup() — core0
@@ -175,6 +197,14 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
 // then on (together with the service-mode routing in DccHal::loop()).
 // See dcc_hal.cpp for the full lifecycle.
     gLeds.begin();  // initialise the status LEDs
+    // Boot-time visual feedback: blink the status LED while core0
+    // works through module registration below, so there's something
+    // visible happening on the board instead of everything staying
+    // dark for the first few seconds. Ends when the final power state
+    // is set further down (onPowerOn()/onPowerOff() there replaces
+    // this blink with the normal solid-on/off indication).
+    gLeds.status.setBlinkMs(150);
+    gLeds.status.setMode(LedMode::LED_BLINK);
 
     // Bring up core infrastructure
     CommandBus::instance().begin();
@@ -190,7 +220,7 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     #ifdef FACTORY_RESET
     EepromStore::instance().clearStorage();   // delete the stored config file
     EepromStore::instance().resetToDefaults(); // reset _params back to their defaults
-    traceSerial.println("*** FACTORY RESET uitgevoerd — default IP 192.168.54.200 ***\r\n");
+    traceSerial.println("*** FACTORY RESET conducted — default IP 192.168.0.200 ***\r\n");
     #endif
 
     // Turnout state (gAccessories[]) is in-memory only now — no
@@ -205,7 +235,7 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     // ── OLED first — show the splash screen before module registration ──
     gOled.begin();
     gOled.showSplash("v2.0");
-    delay(2000);
+    _bootDelay(2000);
 
     // ── Register modules, with status shown on the display ───────────────
     bool r0 = registry().add(&gOled);
@@ -242,7 +272,7 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     traceSerial.printf("add: oled=%d eep=%d dcc=%d rsbus=%d xn=%d web=%d ln=%d\r\n",
                    r0, r1, r2, r2b, r6, r7,r8);
 
-    delay(1500);  // leave the status screen readable for a moment
+    _bootDelay(1500);  // leave the status screen readable for a moment
 
     // ── Start core0 ──────────────────────────────────────────
     // gOled's begin() is called again here but is idempotent
@@ -253,11 +283,55 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     gOled.clear();
     gOled.showPower(false);
 
-    traceSerial.println("Core0 klaar\r\n");
+    traceSerial.println("Core0 ready\r\n");
     __dmb();
 
-    gCentrale.trackPowerOff = true;   // start with track power off
-    gCentrale.emergencyStop = false;
+    // Startup power state — configurable via the web interface's DCC
+    // panel ("dcc.startup_power": 0 = power off, the long-standing
+    // default; 1 = power on), requested so the station can optionally
+    // come up already powered without a manual power-on afterwards.
+    //
+    // The "power on" branch deliberately goes through the exact same
+    // path as a normal user-triggered power-on — dispatching a
+    // CmdType::POWER_ON command onto the CommandBus, here called
+    // directly (synchronous on core0 — see CommandBus::dispatch()) —
+    // rather than just setting gCentrale.trackPowerOff = false
+    // directly, so DccHal::setPower(true) actually runs: enabling the
+    // H-bridges, updating the status LED (gLeds.onPowerOn()) and
+    // publishing the normal POWER_ON event, exactly as if the user had
+    // just pressed "power on". This relies on DccHal already being
+    // registered and begin()-called by this point (registry().add(&gDccHal)
+    // and registry().beginCore0() above), so its CommandBus handler is
+    // already listening.
+    uint8_t startupPower = eepromStore().getUint8("dcc.startup_power", 0);
+    if (startupPower == 1) {
+        // Same flag updates handlePowerOn() (xpressnet_handler.cpp)
+        // does before dispatching, so this boot-time power-on is
+        // indistinguishable from a normal user-triggered one.
+        gCentrale.emergencyStop = false;
+        gCentrale.trackPowerOff = false;
+        gCentrale.shortCircuit  = false;
+        // Calling gDccHal.setPower() directly rather than going
+        // through CommandBus::dispatch() — CommandBus's loop
+        // prevention (_deliverToHandlers()) skips whichever handler's
+        // moduleId matches cmd.sourceId, and DccHal is both the only
+        // handler for POWER_ON and the module actually performing
+        // this boot-time power-on, so a dispatched command would have
+        // had no real "other" sourceId to use without being silently
+        // swallowed (confirmed: this is what happened before this
+        // fix — the LED stayed on its boot blink and track power
+        // never actually came on). setPower(true) already does
+        // everything DccHal's own CmdType::POWER_ON handler does
+        // (enable H-bridges, update the OLED, call gLeds.onPowerOn(),
+        // publish the POWER_ON event via the DCC library's own
+        // notifyRailpower() callback) — so nothing is lost by calling
+        // it directly here.
+        gDccHal.setPower(true);
+    } else {
+        gCentrale.trackPowerOff = true;   // start with track power off
+        gCentrale.emergencyStop = false;
+        gLeds.onPowerOff();  // replace the boot-time blink with the normal "off" state
+    }
     // Station firmware version, reported via XpressNet's Extended
     // Software Version response (0x21/0x23 -> handleExtraVersion()'s
     // "ZBldH"/"ZBldL" bytes). Previously always 0 — gCentrale.buildNr
@@ -322,7 +396,7 @@ void loop() {
     if (gResetRequested) {
         // Stop feeding the watchdog — it will trigger a reset after 8 seconds
         // (or sooner if watchdog_enable was called elsewhere with a shorter timeout)
-        traceSerial.println("RESET: wordt uitgevoerd...\r\n");
+        traceSerial.println("RESET: executed...\r\n");
         Serial2.flush();
         while(true) tight_loop_contents();
     }
@@ -415,7 +489,7 @@ void loop() {
 // ─────────────────────────────────────────────────────────────
 void setup1() {
     while (!gSerial2Ready) tight_loop_contents();
-    traceSerial.println("setup1 gestart\r\n");
+    traceSerial.println("setup1 Started\r\n");
     while (!gCore0Ready) delay(10);
 
     Ethernet.init(HW_ETH_CS_PIN);
@@ -424,16 +498,16 @@ void setup1() {
 
     bool useDhcp = eepromStore().getBool("net.dhcp", true);
     IPAddress ip, gateway, subnet;
-    ip.fromString     (eepromStore().getString("net.ip",      "192.168.54.200"));
-    gateway.fromString(eepromStore().getString("net.gateway", "192.168.54.1"));
+    ip.fromString     (eepromStore().getString("net.ip",      "192.168.0.200"));
+    gateway.fromString(eepromStore().getString("net.gateway", "192.168.0.1"));
     subnet.fromString (eepromStore().getString("net.subnet",  "255.255.255.0"));
 
-    traceSerial.print("Ethernet initialiseren... \r\n");
+    traceSerial.print("Initialize Ethernet... \r\n");
     if (useDhcp) {
         traceSerial.print("DHCP... ");
         if (Ethernet.begin(storedMac, 8000, 4000) == 0) {
             // DHCP failed — re-initialise the W5500 for a static IP
-            traceSerial.print("DHCP mislukt, statisch IP: ");
+            traceSerial.print("DHCP failed, static IP: ");
             Ethernet.init(HW_ETH_CS_PIN);
             delay(100);
             Ethernet.begin(storedMac, ip, gateway, gateway, subnet);
@@ -441,7 +515,7 @@ void setup1() {
             gEthernetUsesDhcp = true;  // DHCP succeeded
         }
     } else {
-        traceSerial.print("Statisch IP: ");
+        traceSerial.print("Static IP: ");
         Ethernet.begin(storedMac, ip, gateway, gateway, subnet);
     }
     traceSerial.println(Ethernet.localIP());
@@ -453,14 +527,14 @@ void setup1() {
         EthernetBonjour.addServiceRecord("TMC Centrale._z21", 21105, MDNSServiceUDP);
         traceSerial.print("mDNS: "); traceSerial.print(hostname); traceSerial.println(".local \r\n");
     } else {
-        traceSerial.println("mDNS: geen geldig IP, overgeslagen\r\n");
+        traceSerial.println("mDNS: no valid IP, skipped\r\n");
     }
 
     // Wait until the W5500 SPI bus is fully released before initialising PIO2
     delay(500);
     // Start handhelds and XpressNet AFTER ethernet — the DHCP timeout is now short enough
     registry().beginCore1();
-    traceSerial.println("setup1: Core1 klaar\r\n");
+    traceSerial.println("setup1: Core1 ready\r\n");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -531,13 +605,13 @@ void _registerDefaultParams() {
     auto& store = eepromStore();
     store.registerString("net.mac",      "DE:AD:BE:EF:FE:ED", 18, 0);
     store.registerString("net.hostname", "tmc-centrale",       32, 0);
-    store.registerString("net.ip",       "192.168.54.200",      16, 0);
-    store.registerString("net.gateway",  "192.168.54.1",        16, 0);
+    store.registerString("net.ip",       "192.168.0.200",      16, 0);
+    store.registerString("net.gateway",  "192.168.0.1",        16, 0);
 
     // System — CDE booster short-circuit response
     static const char* const kCdeModeOpts[] = {
-        "Centrale uit (power-off + LocoNet GPOFF)",   // 0 = current default
-        "Booster lokaal (centrale blijft aan)",        // 1 = passive
+        "Command Station off (power-off + LocoNet GPOFF)",   // 0 = current default
+        "Booster Local (Command Station On)",        // 1 = passive
         nullptr
     };
     store.registerEnum("sys.cde_mode", 0, 0, kCdeModeOpts);
@@ -546,7 +620,7 @@ void _registerDefaultParams() {
     // exists: with no booster wired up, the E-signal floats/reads
     // permanently low, which would otherwise trip a false, never-
     // clearing short-circuit detection continuously.
-    store.registerBool("sys.cde_enable", true, ModuleId::DCC_HAL);
+    store.registerBool("sys.cde_enable", false, ModuleId::DCC_HAL);
     // Turnout output-bit inversion — wiring-dependent, per RCN-213/Z21
     // spec (neither dictates a straight/thrown meaning for the R-bit).
     // Default true matches the historically-tuned behaviour for Rob's
@@ -568,25 +642,46 @@ void _registerDefaultParams() {
     // during an ongoing short (Rob, LSA). See CDE_CLEAR_US's comment
     // in dcc_hal.h.
     store.registerUint16("sys.cde_clear_us", 30, ModuleId::DCC_HAL);
-    // v2 hardware: H-bridge nFAULT escalation policy (all three
-    // bridges) — an isolated fault blip is expected/harmless (the
-    // DRV887x chips' own automatic-retry already handles it), only
-    // repeated faults within this window actually cut track power.
-    // See HBridgeFault::shouldEscalate() in hbridge_fault.h.
-    store.registerUint32("sys.fault_window_ms",  1000, ModuleId::DCC_HAL);
-    store.registerUint8 ("sys.fault_retry_count", 3,   ModuleId::DCC_HAL);
-    // Second, independent signal alongside the two above — see
-    // HBridgeFault::checkDuration()'s comment in hbridge_fault.h for
-    // why this is needed (a genuinely persistent fault doesn't always
-    // accumulate enough debounced edges to trip the count/window
-    // check above, under automatic-retry). May need empirical tuning
-    // (LSA/scope) against this board's actual DRV887x retry timing.
-    store.registerUint32("sys.fault_duration_ms", 50,  ModuleId::DCC_HAL);
-    // Recovery-confirm debounce for checkDuration() above — see that
-    // function's own comment in hbridge_fault.h. Rob may need to tune
-    // this against the actual spacing between blips in a genuine,
-    // sustained fault storm (TraceLog, HBridge source).
-    store.registerUint32("sys.fault_clear_ms", 10, ModuleId::DCC_HAL);
+    // Startup grace period (ms) — see CDE_STARTUP_GRACE_MS's comment
+    // in dcc_hal.h for why this exists: the booster only becomes
+    // active once it sees DCC, and takes a moment to lock onto it,
+    // during which the E-line reads continuously low (was tripping a
+    // false short-circuit on every power-on).
+    store.registerUint16("sys.cde_grace_ms", 300, ModuleId::DCC_HAL);
+    // v2 hardware: H-bridge nFAULT escalation policy — an isolated
+    // fault blip is expected/harmless (the DRV887x chips' own
+    // automatic-retry already handles it), only repeated faults within
+    // this window actually cut track power. See
+    // HBridgeFault::shouldEscalate() in hbridge_fault.h.
+    //
+    // Configured PER BRIDGE (dcc/sm/cde) rather than one shared set —
+    // requested by Rob so e.g. the CDE bridge (a different chip
+    // variant, DRV8876 vs the DCC bridge's DRV8874 — see the "ACK
+    // threshold" web panel's own per-bridge fields, same reasoning)
+    // can be tuned independently if its retry timing differs. Same
+    // defaults as the previous shared "sys.fault_*" keys for all
+    // three, so behaviour is unchanged until Rob tunes one bridge
+    // individually.
+    for (const char* p : { "dcc", "sm", "cde" }) {
+        char key[24];
+        snprintf(key, sizeof(key), "%s.fault_window_ms", p);
+        store.registerUint32(key, 1000, ModuleId::DCC_HAL);
+        snprintf(key, sizeof(key), "%s.fault_retry_count", p);
+        store.registerUint8 (key, 3,    ModuleId::DCC_HAL);
+        // Second, independent signal alongside the two above — see
+        // HBridgeFault::checkDuration()'s comment in hbridge_fault.h
+        // for why this is needed (a genuinely persistent fault doesn't
+        // always accumulate enough debounced edges to trip the
+        // count/window check above, under automatic-retry). May need
+        // empirical tuning (LSA/scope) against this board's actual
+        // DRV887x retry timing, per bridge.
+        snprintf(key, sizeof(key), "%s.fault_duration_ms", p);
+        store.registerUint32(key, 50,   ModuleId::DCC_HAL);
+        // Recovery-confirm debounce for checkDuration() above — see
+        // that function's own comment in hbridge_fault.h.
+        snprintf(key, sizeof(key), "%s.fault_clear_ms", p);
+        store.registerUint32(key, 10,   ModuleId::DCC_HAL);
+    }
     store.registerString("net.subnet",   "255.255.255.0",      16, 0);
     store.registerBool  ("net.dhcp",     true,                     0);
     store.registerUint16("lenz.port",    5550,  ModuleId::LENZ_LAN);
@@ -605,6 +700,15 @@ void _registerDefaultParams() {
     store.registerUint8 ("dcc.steps",       128,  ModuleId::DCC_HAL);
     store.registerBool  ("dcc.railcom",     false,ModuleId::DCC_HAL);
     store.registerUint16("dcc.shortma",     2000, ModuleId::DCC_HAL);
+    // Power state at boot — 0=off (long-standing default, matches the
+    // physical reality that DCC output hasn't been enabled yet at
+    // that point), 1=on. See setup()'s own comment for how this is
+    // applied. Requested so the station can optionally come up
+    // already powered without a manual power-on afterwards.
+    static const char* const kStartupPowerOpts[] = {
+        "Power off (default)", "Power on", nullptr
+    };
+    store.registerEnum("dcc.startup_power", ModuleId::DCC_HAL, 0, kStartupPowerOpts);
     store.registerUint8 ("dcc.progreadmode",3,    ModuleId::DCC_HAL); // 0=off,1=bit,2=byte,3=both
     store.registerUint8 ("dcc.progrepeat",  18,   ModuleId::DCC_HAL); // 7-64
     store.registerUint8 ("dcc.rstsrepeat",  25,   ModuleId::DCC_HAL); // 25-255
@@ -620,6 +724,18 @@ void _registerDefaultParams() {
     store.registerUint16("dcc.ack_mv", 67,  ModuleId::DCC_HAL);
     store.registerUint16("sm.ack_mv",  160, ModuleId::DCC_HAL);
     store.registerUint16("cde.ack_mv", 160, ModuleId::DCC_HAL);
+    // v2 hardware: the RP2350's own ADC reference voltage, in
+    // millivolts, as actually measured on this specific board's 3V3
+    // rail (which feeds the ADC) — used by PowerRailMonitor to convert
+    // a raw ADC reading into millivolts. Was a fixed 3300, but the
+    // real 3V3 rail varies board-to-board within the regulator's own
+    // tolerance (Rob measured 3230mV on his own board with a
+    // multimeter), which scales every reconstructed rail voltage
+    // proportionally — see power_monitor.h's own comment. Default
+    // kept at the nominal 3300 so an unconfigured board still behaves
+    // as before; set this to the actual measured 3V3 rail voltage per
+    // board for accurate readings.
+    store.registerUint16("pwr.vref_mv", 3300, ModuleId::POWER_MONITOR);
     // Turnout addressing
     static const char* const kSwitchSchemaOpts[] = {
         "ROCO", "IB / Intellibox", "Lenz", nullptr
@@ -664,8 +780,17 @@ void _registerDefaultParams() {
     // label/hint text, no actual input — _printField() silently
     // renders nothing for a key findParam() doesn't know about).
     store.registerUint16("rsbus.watchdog_s", 15, ModuleId::RS_BUS_HAL);
+    // Whether the feedback table is cleared when track power is
+    // switched off — see RsBusHal::onEvent()'s own comment for the
+    // full rationale. Default false: keep the last-known state,
+    // matching this project's original (pre-configurable) behaviour.
+    store.registerBool  ("rsbus.clear_on_power", false, ModuleId::RS_BUS_HAL);
     store.registerBool  ("web.enable",   true,  ModuleId::WEBSERVER);
     store.registerUint16("web.port",     80,    ModuleId::WEBSERVER);
+    // Auto-refresh interval (seconds) for the frequently-changing
+    // table panels (Locomotives, Turnouts, Feedback, LocoNet Slots) —
+    // see Webserver::_autoRefresh(). 0 = disabled.
+    store.registerUint16("web.refresh_sec", 4, ModuleId::WEBSERVER);
     // LnTcp (LocoNet-over-TCP / "LbServer") — off by default, matching
     // this project's convention for optional protocol endpoints (see
     // ln_tcp.h for the full design). Rob's own suggestion, requested

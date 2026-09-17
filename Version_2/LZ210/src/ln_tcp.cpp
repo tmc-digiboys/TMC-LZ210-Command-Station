@@ -34,6 +34,7 @@ void LnTcp::loop() {
             c.msgLen   = 0;
             c.lineLen  = 0;
             c.protocol = LnTcpProtocol::UNKNOWN;
+            _connCount--;
             continue;
         }
 
@@ -123,13 +124,18 @@ void LnTcp::_refreshConfig() {
         for (uint8_t i = 0; i < LN_TCP_MAX_CLIENTS; i++) {
             if (_clients[i].active) { _clients[i].tcp.stop(); _clients[i].active = false; }
         }
-        if (_server) { delete _server; _server = nullptr; }
+        _connCount = 0;
+        // Explicit dtor + operator delete instead of `delete _server`
+        // — see trace_log.cpp's _refreshConfig() for why this is
+        // equivalent and well-defined here, avoiding the
+        // -Wdelete-non-virtual-dtor warning on EthernetServer.
+        if (_server) { _server->~EthernetServer(); ::operator delete(_server); _server = nullptr; }
         _enabledCached = false;
         _portCached    = port;
         return;
     }
 
-    if (_server) { delete _server; _server = nullptr; }
+    if (_server) { _server->~EthernetServer(); ::operator delete(_server); _server = nullptr; }
     _server = new EthernetServer(port);
     _server->begin();
     _enabledCached = true;
@@ -146,11 +152,15 @@ void LnTcp::_acceptNew() {
 
     for (uint8_t i = 0; i < LN_TCP_MAX_CLIENTS; i++) {
         if (!_clients[i].active) {
-            _clients[i].tcp      = incoming;
-            _clients[i].active   = true;
-            _clients[i].msgLen   = 0;
-            _clients[i].lineLen  = 0;
-            _clients[i].protocol = LnTcpProtocol::UNKNOWN;
+            _clients[i].tcp         = incoming;
+            _clients[i].ip          = incoming.remoteIP();
+            _clients[i].port        = incoming.remotePort();
+            _clients[i].active      = true;
+            _clients[i].msgLen      = 0;
+            _clients[i].lineLen     = 0;
+            _clients[i].protocol    = LnTcpProtocol::UNKNOWN;
+            _clients[i].connectedMs = millis();
+            _connCount++;
             traceLog().logf(TraceLevel::INFO, TraceSource::LNET,
                              "TCP client connected (slot %u)", i);
             return;

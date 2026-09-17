@@ -106,6 +106,28 @@ constexpr uint32_t CDE_SHORT_US = 500;
 // same way CDE_SHORT_US itself was tuned.
 constexpr uint32_t CDE_CLEAR_US = 30;
 
+// Default/fallback startup grace period: for this long after track
+// power is switched ON, _checkCdeShort() does not evaluate the
+// E-signal at all. Needed because the CDE booster only becomes active
+// once it sees a DCC signal, and takes a moment after that to actually
+// lock onto it — during that window the E-signal reads continuously
+// low, indistinguishable from a genuine dead short by voltage/duration
+// alone (confirmed, Rob: this was tripping a false short-circuit on
+// every power-on). Configurable via "sys.cde_grace_ms" (web
+// interface, Systeem section).
+//
+// This default (300ms) is a reasoned starting point, not a measured
+// value — Rob should confirm via TraceLog/LSA how long his booster
+// actually takes to lock onto DCC after power-on and tune this
+// accordingly (with some margin, the same way CDE_SHORT_US and
+// CDE_CLEAR_US were tuned). Deliberately a SEPARATE setting from
+// CDE_SHORT_US rather than just raising CDE_SHORT_US itself to cover
+// this: CDE_SHORT_US also governs genuine short-circuit reaction time
+// during normal operation, and raising it to hundreds of ms to paper
+// over the power-on transient would slow down real short-circuit
+// protection everywhere, not just at startup.
+constexpr uint32_t CDE_STARTUP_GRACE_MS = 300;
+
 // Number of ADC samples averaged per check (after the settle reads
 // below). The RP2350's ADC is datasheet-specified at 9-9.2 ENOB
 // (~5.6-6.4mV per effective step over the 3.3V range) — comfortably
@@ -280,6 +302,17 @@ private:
     //                sample.
     uint32_t _cdeFaultSinceUs    = 0;
     uint32_t _cdeRecoverSinceUs  = 0;
+
+    // millis() timestamp of the most recent power-on (setPower(true)),
+    // used by _checkCdeShort()'s startup grace period — see
+    // CDE_STARTUP_GRACE_MS's comment for why this exists.
+    uint32_t _powerOnMs          = 0;
+
+    // Set true by emergencyStop() (CmdType::EMERGENCY_STOP), cleared
+    // by the next setSpeed() call — see setSpeed()'s own comment for
+    // why it's specifically gated on this flag rather than clearing
+    // the LED on every speed command unconditionally.
+    bool     _inEmergencyStop    = false;
 
     // Static CommandBus handler — called on core0 for each incoming command
     static void _onCommand(const Command& cmd);

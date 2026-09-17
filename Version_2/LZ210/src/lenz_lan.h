@@ -56,6 +56,14 @@
 // ─────────────────────────────────────────────────────────────
 struct LenzClient {
     EthernetClient tcp;                      // TCP socket
+    IPAddress      ip;                       // Client IP — cached at accept time, since
+                                              // EthernetClient::remoteIP()/remotePort() are
+                                              // not const in this Ethernet library version
+                                              // and so cannot be called through the const
+                                              // LenzClient& the web interface's clientAt()
+                                              // hands out (see webserver.cpp's Active
+                                              // Clients table).
+    uint16_t       port;                     // Client TCP port — cached, same reason as ip
     uint8_t        rxBuf[LENZ_LAN_RX_BUF];  // Receive buffer
     uint8_t        rxLen;                    // Bytes currently in rxBuf
     bool           progMode;                 // True if client is in programming mode
@@ -63,7 +71,7 @@ struct LenzClient {
     uint32_t       frameStartMs;            // Timestamp at which the current incomplete frame started (0 = none)
     bool           active;                   // True if this slot is in use
 
-    LenzClient() : rxLen(0), progMode(false), lastActMs(0), frameStartMs(0), active(false) {}
+    LenzClient() : port(0), rxLen(0), progMode(false), lastActMs(0), frameStartMs(0), active(false) {}
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -89,6 +97,13 @@ public:
 
     uint8_t connectionCount() const override { return _connCount; }
     uint8_t maxConnections()  const override { return LENZ_LAN_MAX_CLIENTS; }
+
+    // Read-only access to a client slot, for the web interface's own
+    // "Active Clients" table (see Z21Lan's clientAt(), which this
+    // mirrors) — IP/port come from the slot's own tcp socket
+    // (tcp.remoteIP()/remotePort()) since, unlike Z21Client, LenzClient
+    // has no separate ip/port fields of its own.
+    const LenzClient& clientAt(uint8_t i) const { return _clients[i]; }
 
 // Feedback queue — buffers RS-Bus events that arrive during client processing
 #define LENZ_LAN_FB_QUEUE_SIZE  56   // Maximum queued addr/data pairs (28 pairs × 2)

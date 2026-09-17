@@ -54,7 +54,7 @@ public:
     void loop()   override;
 
     // No event broadcasting — the web server is read-only for events
-    void onEvent(const Event& ev) override {}
+    void onEvent(const Event&) override {}
 
     uint8_t connectionCount() const override { return _activeClients; }
     uint8_t maxConnections()  const override { return WEB_MAX_CLIENTS; }
@@ -128,6 +128,21 @@ private:
 
     // Renders one form field for an EepromStore parameter key
     void _printField(EthernetClient& c, const char* key, const char* label);
+
+    // Prints an inline <script> that reloads the page after `seconds`
+    // seconds (reads EepromStore "web.refresh_sec" if seconds==0 is
+    // NOT passed explicitly — call with the stored value, 0 disables).
+    // Deliberately a plain setTimeout(()=>location.reload(), ...)
+    // rather than <meta http-equiv='refresh'>, since that can less
+    // gracefully interrupt an in-progress confirm() dialog or form
+    // interaction — several of these panels have a "Clear table"
+    // confirmation button. Call this AFTER _shellOpen() (or anywhere
+    // in that panel's own render function); it just prints a <script>
+    // tag inline wherever it's called from. This is a simple
+    // full-page reload rather than partial/AJAX updates, matching
+    // this project's existing lightweight request/response web server
+    // (no persistent connections).
+    void _autoRefresh(EthernetClient& c, uint16_t seconds = 4);
 
     // v2 hardware: short display string for an AckState value, used
     // in _panelDccHal()'s H-bridge status table (see dcc_current_monitor.h).

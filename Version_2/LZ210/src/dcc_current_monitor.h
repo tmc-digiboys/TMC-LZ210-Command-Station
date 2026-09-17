@@ -179,6 +179,17 @@ public:
     // Returns the last raw ADC reading (0-4095)
     uint16_t lastAdcValue()    const { return _lastAdc; }
 
+    // Returns the last SENSE reading converted to millivolts, using
+    // the board's own calibrated ADC reference ("pwr.vref_mv" — see
+    // power_monitor.h's equivalent conversion for the power-rail
+    // readings, same formula/reasoning) rather than the fixed
+    // DCC_ADC_VREF_MV nominal value, so this reading is calibrated
+    // consistently with the rest of the web interface.
+    uint16_t lastMv() const {
+        uint16_t vrefMv = eepromStore().getUint16("pwr.vref_mv", DCC_ADC_VREF_MV);
+        return (uint16_t)(((uint32_t)_lastAdc * vrefMv) / DCC_ADC_MAX);
+    }
+
     // Returns the current state of the ACK detection state machine
     AckState ackState()        const { return _ackState; }
 

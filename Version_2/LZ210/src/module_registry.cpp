@@ -176,10 +176,10 @@ void ModuleRegistry::beginCore1() {
     for (uint8_t i = 0; i < _count; i++) {
         if (!_modules[i]->enabled()) continue;
         if (_modules[i]->core() == ModuleCore::CORE1) {
-            traceSerial.print("beginCore1: start ");
+            traceSerial.print("startCore1: begin ");
             traceSerial.println(_modules[i]->name());
             _modules[i]->begin();
-            traceSerial.print("beginCore1: klaar ");
+            traceSerial.print("startCore1: ready ");
             traceSerial.println(_modules[i]->name());
         }
     }
