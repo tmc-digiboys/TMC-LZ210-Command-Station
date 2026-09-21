@@ -1,4 +1,60 @@
 // ═══════════════════════════════════════════════════════════════
+// This is the implementation of the LZ210. In order to build the 
+//
+// Building the LZ210 Software  
+//   For the LZ210 software, the following libraries are needed:
+//
+// - The standard Ethernet Library
+//   The standard Etnernet library is available in the installed library package, so it doesn't have to be installed seperately.
+// - The EthernetBonjour Library 
+//   The LZ210 supports mDNS functionality which is implemented via the EthernetBonjour library, therefore this library needs to 
+//   be installed. The library can be found in the library configurator of the arduino IDE.
+// - The RS-Bus Master library
+//   This library is provided in the repositories of the github of Aiko Pras: https://github.com/aikopras/RSbusMaster.git.
+//   It handles the communication with the RS-Bus feedback decoders.
+// - The Loconet2-master-TMC library
+//   This library can be found in the repositories on the github page of TMC-Digiboys: https://github.com/tmc-digiboys/Loconet2-Master-TMC.git.
+//   The Loconet2-TMC library implements the basic communication with the Loconet interface. This library is used by the Loconet module of the 
+//   LZ210. The interfcae implemented is based upon the loconet personall edition At this moment only the FREMO FREDS are supported.
+// - The DCCInterfaceMaster-TMC library
+//   This library implements the DCC interface of the LZ210. It can be foundein the following git hb repositroy https://github.com/tmc-digiboys/DCCInterfaceMaster-TMC.git.
+//   This library should be configured to use de RP 2040 in the variants- Z21PG. 
+// - The Embedded Template Library ( ETL ) by John Wellbelove
+//   This library provides for templates which are used in the loconet2-TMC-master library.
+//
+//   Also the following items for building with the arduino IDE should be set:
+//   -  The LZ210 Version-2 Hardware is build around the olimex Pico2 XL development board, therefore this board should be selected in as 
+//      the board for the LZ210 in the tools menu from the arduino IDE. Use is made of the board package that has to be selected is 
+//      the olimex PICO2 XL by Earl Philhower, III.
+//   -  The LZ210 also uses a file system for the flash storage of configuration parameters, therefore this should be configured in the arduino-ide as well.  
+//      In the Arduino IDE select Tools - Flash Size and select minimal 2MB(Sketch: 1920KB, FS: 128KB). 
+//   -  In order to operate normally, the Tools - CPU Speed: should be set 150 MHz, no overclocking is used nor required. 
+//      Setting the clock speed to a different value will cause erratic behavior.
+//
+// First Time Use
+//   The LZ210 Version-2 Hardware is build around the olimex Pico2 XL development board, therefore this board should be selected in as the board for 
+//   the LZ210 in the tools menu from the arduino IDE. Use is made of the board package that has to be selected is the olimex Pico2 XL by Earl Philhower, III.
+// 
+//   During the first LZ210 starts-up it will store default configuration values in the flash filesystem. These configuration parameters can later be modified 
+//   in the webpages. 
+//
+//   When the power is connected to the LZ210, the builtin LED and the red status LED will start flashing indicating the LZ210 is starting-up. After Start-up, 
+//   the LZ210 enters the power-off mode. In order to bring the LZ210 to the operation state, a power-on command should be given via either a ROCO multimouse 
+//   or a Lenz LH100 handheld. In Fact it should be possible to use any Handheld connected via Xpressnet RS-485, but only these two are tested. Another way to 
+//   set the LZ210 in the operational mode is connecting a PC via the available ethernet connector, and use a program like RocRail to send a Power-On command
+//   with  Xpressnet over TCP, Xpressnet over USB or Z21 connection. In case the LZ210 is in a operatioonal mode the red status LED and the builtin LED will burn steady. 
+//   In this case the LZ210 is sending its DCC SIgnals over the DCC main Port and the booster ports. The state, Power-on or power-off,  in which the LZ210 starts-up, is configurable via the website. 
+// 
+//   The LZ210 board provides several LEDS. The red late is the general status led. Other leds provide information if communication protocols are used, i.e if DCC traffic is present, Xpressnet traffic is ongoing, etc.
+//   See the board Layout for the meeaning of the LEDs. ( due to a miscalculation in the hardware version 2 and 2.1 , the DCC  function is handled by the xpressnet LED as well and the red LED is STATUS,
+//   this will be solved in the next revision of the Harware)
+//
+//   The LZ210 has a serial debug port. Connecting a serial to USB converter to this port, with baudrate 115200, data bits 8, no parity, some logging is performed on a local terminal like putty or the provided QT tracelog program.
+//   The LZ210 provides for a TRACE/LOG facility. this kan be accessed via the ethernet connector with a TCP connection. One can use for example use putty in RAW mode on prot 23456 or use the
+//   Provide QT6 TraceLog program. This program is written for linux but can be simply adapted for windows or MacOS by changing the Cmakelist.txt file.
+//   On the webpage of the LZ210 sevreal configuration parameters kan be set for this trace/log function.
+//
+// ═══════════════════════════════════════════════════════════════
 //  LZ210 v1.0 — Modular architecture, top-level sketch
 //
 //  This is the Arduino entry-point file. It does not contain any
@@ -53,6 +109,7 @@
 #include "src/xpressnet_rs485.h"
 #include "src/lenz_lan.h"
 #include "src/lenz_usb.h"
+#include "src/serial_config.h"
 #include "src/z21_lan.h"
 #include "src/trace_log.h"
 #include "src/webserver.h"
@@ -213,6 +270,29 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
 
     _registerDefaultParams();
     EepromStore::instance().begin();
+
+    // "dbg.baud"/"dbg.databits"/"dbg.parity"/"dbg.stopbits" (web
+    // interface, USB/Serial panel) for the debug/trace UART (Serial2).
+    // Applied here rather than at the original Serial2.begin(115200)
+    // call above: that call happens BEFORE EepromStore has loaded
+    // anything from flash, so it always starts at this fixed,
+    // known-safe rate/framing first — every boot message up to this
+    // point is never lost to a not-yet-readable or misconfigured
+    // EEPROM value. Only re-opens the port if the configured baud
+    // actually differs from the boot default, to avoid an unnecessary
+    // reset on the (default, common) 115200/8N1 case — note this means
+    // a non-default framing (data bits/parity/stop bits) combined with
+    // the default 115200 baud would not trigger a re-open; framing
+    // changes in practice are expected alongside a baud change. A
+    // terminal watching from power-on needs to reconnect at the new
+    // settings once this fires — an inherent limitation of changing a
+    // serial port's own settings while it's the thing you're watching
+    // the boot log through.
+    uint32_t dbgBaud = eepromStore().getUint32("dbg.baud", 115200);
+    if (dbgBaud != 115200) {
+        Serial2.end();
+        Serial2.begin(dbgBaud, serialConfigFromEeprom("dbg"));
+    }
 
     // ── Factory reset check ──────────────────────────────────
     // Uncomment #define FACTORY_RESET at the top of this file,
@@ -785,6 +865,21 @@ void _registerDefaultParams() {
     // full rationale. Default false: keep the last-known state,
     // matching this project's original (pre-configurable) behaviour.
     store.registerBool  ("rsbus.clear_on_power", false, ModuleId::RS_BUS_HAL);
+    // USB (LenzUsb, native USB CDC — XpressNet-over-USB, e.g. for
+    // Rocrail) and debug/trace UART (Serial2) serial port settings —
+    // see LenzUsb::begin(), setup()'s own comments, and
+    // serial_config.h for how these are applied/defaults/rationale.
+    store.registerUint32("usb.baud", LENZ_USB_BAUD, ModuleId::LENZ_USB);
+    store.registerUint32("dbg.baud", 115200,        ModuleId::TRACE_LOG);
+    static const char* const kDataBitsOpts[] = { "5", "6", "7", "8", nullptr };
+    static const char* const kParityOpts[]   = { "None", "Even", "Odd", nullptr };
+    static const char* const kStopBitsOpts[] = { "1", "2", nullptr };
+    store.registerEnum("usb.databits", ModuleId::LENZ_USB, 3, kDataBitsOpts);
+    store.registerEnum("usb.parity",   ModuleId::LENZ_USB, 0, kParityOpts);
+    store.registerEnum("usb.stopbits", ModuleId::LENZ_USB, 0, kStopBitsOpts);
+    store.registerEnum("dbg.databits", ModuleId::TRACE_LOG, 3, kDataBitsOpts);
+    store.registerEnum("dbg.parity",   ModuleId::TRACE_LOG, 0, kParityOpts);
+    store.registerEnum("dbg.stopbits", ModuleId::TRACE_LOG, 0, kStopBitsOpts);
     store.registerBool  ("web.enable",   true,  ModuleId::WEBSERVER);
     store.registerUint16("web.port",     80,    ModuleId::WEBSERVER);
     // Auto-refresh interval (seconds) for the frequently-changing

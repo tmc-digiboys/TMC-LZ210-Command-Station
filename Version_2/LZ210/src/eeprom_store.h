@@ -25,7 +25,21 @@
 
 #define EEPROM_STORE_FILE      "/config.bin"
 #define ACCESSORIES_FILE       "/accessories.bin"  // persistent turnout states
-#define EEPROM_MAX_PARAMS      64
+// Maximum number of EEPROM-backed parameters this project can
+// register. Raised from 64 to 128 (Rob, confirmed by counting every
+// actual registerXxx() call including loops: this project is already
+// at 82 and climbing) — past this cap, _registerParam() silently
+// returns false (now logged as a WARNING, see its own comment) and
+// that parameter simply never exists: no crash, but findParam() never
+// finds it, so both getters/setters silently fall back to their
+// caller-supplied default and _printField() renders nothing for it on
+// the web interface — this exact failure mode cost a long multi-page
+// debugging session (Web Interface's refresh field and the entire
+// Debug Log page's TCP Stream/Filtering fields all silently vanishing)
+// before the real cause (this cap, not a per-field bug) was found.
+// Plain RAM cost, not a flash layout — sizeof(ParamDef) * 128 is a few
+// KB on a board with several hundred KB free, trivial either way.
+#define EEPROM_MAX_PARAMS      128
 #define EEPROM_KEY_MAX_LEN     24
 #define EEPROM_COMMIT_DELAY_MS 5000   // write 5s after the last change
 

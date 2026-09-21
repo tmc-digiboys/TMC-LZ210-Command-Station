@@ -128,6 +128,12 @@ private:
 
     // Renders one form field for an EepromStore parameter key
     void _printField(EthernetClient& c, const char* key, const char* label);
+    // Prints s into c with '&', '\'', '<' and '>' escaped, safe to use
+    // inside a single-quoted HTML attribute value. Used by
+    // _printField()'s STRING case — an unescaped stored value
+    // containing a quote could otherwise break out of the surrounding
+    // value='...' attribute and corrupt the rest of the page.
+    void _printEscaped(EthernetClient& c, const char* s);
 
     // Prints an inline <script> that reloads the page after `seconds`
     // seconds (reads EepromStore "web.refresh_sec" if seconds==0 is
@@ -156,6 +162,7 @@ private:
     // Each panel renders a section of the configuration page.
 
     void _panelSysteem  (EthernetClient& c);  // System: CDE short-circuit response etc.
+    void _panelUsbSerial(EthernetClient& c);  // USB / Serial: usb.*/dbg.* port settings
     void _panelInternet (EthernetClient& c);  // Network: IP, MAC, hostname, DHCP
     void _panelLenzLan  (EthernetClient& c);  // LenzLAN: port, timeout
     void _panelLnTcp    (EthernetClient& c);  // LocoNet-over-TCP: enable, port

@@ -36,6 +36,16 @@ void Webserver::loop() {
     if (client) {
         _activeClients++;
         _handleClient(client);
+        // flush() before stop() — without this, stop() can close the
+        // connection before all buffered response bytes have actually
+        // been transmitted by the W5500, silently truncating the HTTP
+        // response once a page's total size gets large enough (grows
+        // worse the bigger the page — confirmed, Rob: the Web
+        // Interface and Debug Log pages, both grown substantially over
+        // this project's history, were cutting off mid-page while
+        // smaller pages were unaffected). flush() blocks until
+        // everything previously written has actually gone out.
+        client.flush();
         client.stop();
         _activeClients--;
     }
@@ -332,6 +342,23 @@ void Webserver::_navItem(EthernetClient& c, const char* id,
 //  Unknown/unhandled parameter types are silently skipped (return
 //  with nothing rendered beyond the label).
 // ─────────────────────────────────────────────────────────────
+// _printEscaped() — see webserver.h for why this exists (a STRING
+// EEPROM value containing a quote/angle-bracket could otherwise break
+// the surrounding HTML). Escapes one character at a time rather than
+// building an escaped copy first, so there's no fixed-size buffer to
+// overflow regardless of how long s is.
+void Webserver::_printEscaped(EthernetClient& c, const char* s) {
+    for (; *s; s++) {
+        switch (*s) {
+            case '&':  c.print(F("&amp;"));  break;
+            case '\'': c.print(F("&#39;"));  break;
+            case '<':  c.print(F("&lt;"));   break;
+            case '>':  c.print(F("&gt;"));   break;
+            default:   c.print(*s);          break;
+        }
+    }
+}
+
 void Webserver::_printField(EthernetClient& c, const char* key,
                              const char* label) {
     const ParamDef* p = eepromStore().findParam(key);
@@ -357,14 +384,17 @@ void Webserver::_printField(EthernetClient& c, const char* key,
         case ParamType::UINT8:  snprintf(val,sizeof(val),"%u",p->value.u8);  break;
         case ParamType::UINT16: snprintf(val,sizeof(val),"%u",p->value.u16); break;
         case ParamType::UINT32: snprintf(val,sizeof(val),"%lu",p->value.u32);break;
-        case ParamType::STRING: snprintf(val,sizeof(val),"%s",(const char*)p->value.bytes); break;
+        case ParamType::STRING:
+            c.print(F("<input type='text' name='")); c.print(key);
+            c.print(F("' value='"));
+            _printEscaped(c, (const char*)p->value.bytes);
+            c.print(F("' maxlength='")); c.print(p->size - 1); c.print(F("'>"));
+            return;
         default: return;
     }
     c.print(F("<input type='text' name='")); c.print(key);
     c.print(F("' value='")); c.print(val);
-    c.print(F("' maxlength='"));
-    c.print(p->type == ParamType::STRING ? p->size - 1 : 10);
-    c.print(F("'>"));
+    c.print(F("' maxlength='10'>"));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -445,6 +475,7 @@ void Webserver::_buildSidebar(EthernetClient& c, const char* active) {
     c.print(F("<div class='ns'>System</div>"));
     _navItem(c, "fabriek",  "Factory Reset",active);
     _navItem(c, "systeem",  "System",       active);
+    _navItem(c, "usbserial","USB / Serial", active);
     _navItem(c, "internet", "Internet",     active);
     _navItem(c, "lenzlan",  "LenzLAN",      active);
     _navItem(c, "lntcp",    "LocoNet-over-TCP", active);
@@ -502,6 +533,7 @@ void Webserver::_shellClose(EthernetClient& c) {
 // ─────────────────────────────────────────────────────────────
 void Webserver::_handleRoot(EthernetClient& c, const char* panel) {
     if (strcmp(panel, "systeem")  == 0) { _panelSysteem(c);   return; }
+    if (strcmp(panel, "usbserial") == 0) { _panelUsbSerial(c); return; }
     if (strcmp(panel, "lenzlan")  == 0) { _panelLenzLan(c);  return; }
     if (strcmp(panel, "lntcp")    == 0) { _panelLnTcp(c);    return; }
     if (strcmp(panel, "z21")      == 0) { _panelZ21(c);      return; }
@@ -647,6 +679,46 @@ void Webserver::_panelSysteem(EthernetClient& c) {
         }
         c.print(F("</table>"));
     }
+    _shellClose(c);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Panel: USB / Serial ports
+// ─────────────────────────────────────────────────────────────
+void Webserver::_panelUsbSerial(EthernetClient& c) {
+    _shellOpen(c, "usbserial", "USB / Serial");
+    c.print(F("<h2>USB / Serial ports</h2>"
+              "<form method='POST' action='/config'>"
+              "<input type='hidden' name='_p' value='usbserial'>"));
+    c.print(F("<fieldset><legend>USB (XpressNet-over-USB)</legend>"
+              "<p class='hint'>Used by client software connecting over "
+              "USB, e.g. Rocrail (whose own default of 57600 baud also "
+              "happens to be this port's default here). This is native "
+              "USB CDC (a virtual serial port over USB) — most CDC-ACM "
+              "drivers only report/track data bits, parity and stop bits "
+              "rather than actually applying them to real framing, unlike "
+              "a genuine UART, so these three settings matter mainly for "
+              "client software that insists on specific values regardless.</p>"));
+    _printField(c, "usb.baud",     "Baud rate");
+    _printField(c, "usb.databits", "Data bits");
+    _printField(c, "usb.parity",   "Parity");
+    _printField(c, "usb.stopbits", "Stop bits");
+    c.print(F("</fieldset>"
+              "<fieldset><legend>Debug/trace port (Serial2)</legend>"
+              "<p class='hint'>A genuine UART, unlike the USB port above — "
+              "these settings are applied for real. Reconnect your "
+              "terminal at the new settings after they take effect.</p>"));
+    _printField(c, "dbg.baud",     "Baud rate");
+    _printField(c, "dbg.databits", "Data bits");
+    _printField(c, "dbg.parity",   "Parity");
+    _printField(c, "dbg.stopbits", "Stop bits");
+    c.print(F("</fieldset>"
+              "<p class='hint'>Both ports take effect after the next "
+              "reboot (Systeem panel's own Restart button, or a power "
+              "cycle) — not live while connected, so changing your own "
+              "debug session's settings here wouldn't have anywhere to "
+              "apply to yet.</p>"
+              "<button class='btn'>Save</button></form>"));
     _shellClose(c);
 }
 

@@ -1,14 +1,19 @@
 # TMC-LZ210
 
-The TMC-LZ210 is a DCC Command Station. It supports the following functions: the DCC protocol via the normal DCC output, the DCC protocol via a CDE booster output, and the DCC protocol via a LocoNet booster. Furthermore, it supports various communication interfaces, i.e. XpressNet over LAN/USB, XpressNet via RS-485, and the Z21 protocol via a UDP LAN interface. A web server provides the possibility to configure several command-station-specific configuration parameters. For feedback support, an RS-Bus interface is present for handling a maximum of 128 feedback decoders.
+The TMC-LZ210 is a DCC Command Station. It supports the following functions: the DCC protocol via the normal DCC output, the DCC protocol via a CDE booster, and the DCC protocol via a LocoNet booster. Furthermore, it supports various communication interfaces, i.e. XpressNet over LAN/USB, XpressNet via RS-485, the Z21 protocol via a UDP LAN interface, and loconet over TCP interface. A web server provides the possibility to configure several command-station-specific configuration parameters. For feedback support, an RS-Bus interface is present for handling a maximum of 128 feedback decoders.
+## content
+* [1. Software Architecture](#software-architecture)
+* [2. Development Environment](#development-environment)
+* [3. First time Use](#first-time-use)
+
 
 ## Software Architecture
 
-The architecture of the TMC-LZ210 command station is built around the dual-core functionality of the RP2350 Pico 2 microcontroller. 
+ The Architecture described  in here is based upon the Hardware version-2. The architecture of the TMC-LZ210 command station is built around the dual-core functionality of the Olimex RP2350B XL  Pico 2 microcontroller. Core-1 handles the external communication interfaces. The communication protocols implemented are: xpressnet over TCP, xpressnet over USB, xpressnet over RS-485, Z21 protocol over UDP, Loconet oevr Serial-CMSA/CD and Loconet over TCP. COre-0 handles the HW interfaces wich are directly related to train control like DCC, RS-BUS. Also some support functies ie. power monitoring and oled communication. In order to communicate between Core-0 and Core-1 a shared amemory interconnect is implemented to make this safely possible. The picture below provides the overview of the architecture.
 
-[![Screenshot](images/Architecture_LZ210.png)](images/Architecture_LZ210.png)
+[![Screenshot](images/Architecture_Version2_LZ210.png)](images/Architecture_Version2_LZ210.png)
 
-Three high-level main modules can be identified:
+Four high-level main modules can be identified in the picute above :
 
 - **The Core 1 networking and client protocol module:**
 
@@ -23,7 +28,7 @@ Three high-level main modules can be identified:
 
     - **The xn_interface module:**
       
-      Handles the common messages for the interface — the messages that are local to the Lenz 23151 module — and provides functions to send XpressNet messages via LAN and USB.
+      Handles the common messages for the interface — the messages that are local to the Lenz 23151 module — and provides functions to send XpressNet messages via LAN and USB. Other messages will be passed to the associated xpressnet instance for futher handling. 
       
 
     - **The Lenz LAN module:**
@@ -32,7 +37,7 @@ Three high-level main modules can be identified:
 
     - **The Lenz USB module:**
      
-      Handles the single USB Serial interface.
+      Handles all xpressnet communication over a single USB Serial interface.
 
   - **The XpressNet RS-485 master interface module:**
 
@@ -45,8 +50,22 @@ Three high-level main modules can be identified:
 
   - **The web server:**
 
-    HTTP configuration and monitoring interface on port 80. Pure server-side HTML (no JavaScript), with page selection through ?p=<panel>. Displays and edits network settings, specific module parameters  for the LZ210 (DCC, RS-Bus, XpressNet, etc.), locomotive and turnout tables, and the RS-Bus feedback table.
+    The web Server is a simple HTTP configuration and monitoring interface on port 80. Pure server-side HTML (no JavaScript), with page selection through ?p=<panel>. Displays and edits network settings, specific module parameters  for the LZ210 (DCC, RS-Bus, XpressNet, etc.), locomotive and turnout tables, and the RS-Bus feedback table.
     
+  - **The LocoNet interface module:**
+    
+     The Loconet interface supported is based on the Personel edition 1999 specification only. It consists of three modules the slotserver, the loconet bus handler and the loconet tcp handeler.
+
+    - **The SLot Server:**
+      The Slot Server internally contains a SlotServer (120 LocoNet slots with a FREE → COMMON → IN_USE → IDLE → FREE lifecycle). Reads locomotive state from LocoRepository and propagates changes through CommandBus and EventBus.It also sends message through the two loconet interfaces.
+
+    - ** Loconet Bus  module Wraps the LocoNet2 library, which handles the loconet communication via de Serial protocol with CSMA/CD
+
+  - **The Trace/Log module:**
+     
+     The Trace/log module provides for debug logging information over a TCP connection. It provides the developer with an indepth view of the LZ210's operation.  The follwoing types of trace groups are identified: DEBUG, INFO, WARNING and ERROR. The Trace/Log module can be configured via the web interface. Here a specific debug level can be set and several debug modules kan be enabled or disabled to do  basic filtering of messages.
+
+
 - **The Core 0 ↔ Core 1 shared-memory interconnect module:**
 
   The Core 0 / Core 1 interconnect is the shared-memory communication path between Core 0 and Core 1, made thread-safe. It consists of the command bus, for communication from Core 1 to Core 0, and the event bus, for communication the other way around. The EEPROM handler and the locomotive repository are also part of this layer, because they need to be accessible from both cores.
@@ -59,14 +78,6 @@ Three high-level main modules can be identified:
 
     The EventBus mdoule handels the shared memory communication between core-0 and core-1. It is a Lock-free ring buffer in the opposite direction. Hardware modules publish Events (power status, locomotive state changes, RS-Bus feedback, short circuits) that are distributed to all registered protocol modules. The events are intended for broadcast.
 
-  - **The LocoRepository module:** 
-
-    The central locomotive state table containing speed, direction, functions F0–F68, momentary flags, and LocoNet slot associations. Accessible from both cores through lock/unlock (spinlock) mechanisms and used by all protocol modules, DccHal, and SlotServer.
-
-  - **The EepromStore module:**
-
-    Persistent key-value storage using LittleFS on flash memory (replacing traditional EEPROM). Stores all configuration parameters. The webserver reads and writes through the same API used by the modules themselves.
-
 - **The Core 0 DCC hardware connection module:**
 
   The Core 0 DCC hardware connection module contains the following modules:
@@ -78,23 +89,32 @@ Three high-level main modules can be identified:
   - **RS-Bus module:**
 
     The RS-Bus HAL module uses the RS-Master library for the communication with the feedback modules. It Polls every 10 ms the RS-Bus library to see if new feedback events are occured, maintains a _nibble[129][2] cache , and publishes FEEDBACK_BULK events whenever changes are detected. Accoding to the RS-Bus specification a total ammount of 128 feedback modules are supported providing for  1024 different feedback points.
-
-  - **The LocoNet interface module:**
-    
-    the Loconet Interfcae module Wraps the LocoNet2 library ) and internally contains a SlotServer (120 LocoNet slots with a FREE → COMMON → IN_USE → IDLE → FREE lifecycle). Reads locomotive state from LocoRepository and propagates changes through CommandBus and EventBus.
-    At this moment it handles only the communication with the FREMO Fred handheld. No other interfaces to LocoNet devices are  for the moment foreseen. The Loconet interface supported is based on the Personel edition 1999 specification only.
-
-  - **The LED handler:**
-
-    A generic class that handles all control of the on-board LEDs. At the moment there is an LED for the status of the command station, which flashes when a short circuit is detected. The LED handler is also used for LEDS indicating traffic on the Ethernet interface, the RS-Bus interface  and the DCC  interface.
-
+  
   - **The Oled Display Handler:**
     
     Th Oled display handler is used for communicating with the optional Oled display via I2C. Currently it provides basic initialisation information but is futher not used for displaying system information. This module is optional.
 
-  - **The DCC Current Handler module:**
+  - **The Power Monitor:**
 
-    The DCC Current handler is reponsible for the detection of an shortcircuit on the DCC interface and for the detection of an ACk pulse during programming a decoder. Currently this is deactivated due to hardware issues.
+  The Power Monitor monitors the three power rails available in the LZ210. During power-up a check will be done if power is available on all three power rails. When in Operational mode the status of the power rails kan be checked via the associated web page.
+ 
+ - **The support functions:**
+
+  - **The LocoRepository module:** 
+
+    The central locomotive state table containing speed, direction, functions F0–F68, momentary flags, and LocoNet slot associations. Accessible from both cores through lock/unlock (spinlock) mechanisms and used by all protocol modules, DccHal, and SlotServer.
+
+  - **The EepromStore module:**
+
+    Persistent key-value storage using LittleFS on flash memory (replacing traditional EEPROM). Stores all configuration parameters. The webserver reads and writes through the same API used by the modules themselves.
+
+  - **The LED handler:**
+
+    A generic class that handles all control of the on-board LEDs. At the moment there is an LED for the status of the command station, which flashes when a short circuit is detected. The LED handler is also used for LEDS indicating traffic on the Ethernet interface, the RS-Bus interface  and the DCC  interface.
+ 
+  - ** The Module Registery:**
+
+    The module Registery is a central, single-instance lifecycle manager for all ModuleBase-derived modules. Every module registers itself with it once at startup (add()); the registry then drives begin()/loop() on each module on its correct core (beginCore0()/loopCore0() vs. beginCore1()/loopCore1()), and detects GPIO pin and PIO state-machine conflicts between modules at registration time, before anything runs. It also acts as a simple directory (find()/isRegistered()) so any module can look up another registered module by ID.
 
 
 ## Development Environment
@@ -113,17 +133,17 @@ The LZ210 software depends on several available Libraries, inorder to build the 
 
   The standard Etnernet library is available in the installed library package, so it doesn't have to be installed seperately.
 
-- **The Bonjour Library**
+- **The EthernetBonjour Library**
 
-  The LZ210 supports mDNS functionality which is implemented via the Bonjour library, therefore this library needs to be installed.
+  The LZ210 supports mDNS functionality which is implemented via the EthernetBonjour library, therefore this library needs to be installed. The library can be found in the library configurator of the arduino IDE.
 
 - **The RS-Bus Master library**
   
-  This library is provided in the repositories of the github of Aiko Pras. It handles the communication with the RS-Bus feedback decoders.
+  This library is provided in the repositories of the github of Aiko Pras: https://github.com/aikopras/RSbusMaster.git. It handles the communication with the RS-Bus feedback decoders.
 
 - **The Loconet2-master-TMC library**
 
-  This library can be found in the repositories on the github page of TMC-Digiboys. The Loconet2-TMC library implements the basic communication with the Loconet interface. This library is used by the Lcocnet module of the LZ210. At this moment only the FREMO FREDS are supported.
+  This library can be found in the repositories on the github page of TMC-Digiboys: https://github.com/tmc-digiboys/Loconet2-Master-TMC.git. The Loconet2-TMC library implements the basic communication with the Loconet interface. This library is used by the Loconet module of the LZ210. The interfcae implemented is based upon the loconet personall edition At this moment only the FREMO FREDS are supported.
 
 - **The DCCInterfaceMaster-TMC library**
 
@@ -137,7 +157,7 @@ The LZ210 software depends on several available Libraries, inorder to build the 
 ### Main Ino file
 
 The main ino file for the LZ210 is provided in the repsoitory. This file defines the compleet functionality of the LZ210. 
-This file is neede for the LZ210 software. Some configuration can be done in this ino file to configure the configuration of the LZ210.
+This file is needed for the LZ210 software. Some configuration can be done in this ino file to configure the configuration of the LZ210.
 
 ### RP2350 Hardware functions
 
@@ -151,17 +171,16 @@ The Raspberry PI RP-2350 supports several hardware functions below is a descript
 - The RP2350 has three seperate PIO available all these PIOs are currently in use in the LZ210:
 
   - PIO 0 is in use in the DCCInterface Master-TMC library to realize a correct stable DCC signal. for more info see the description of the library.
-  - PIO 1 is in use in the RS-Bus master library to implement the rsbus interface for communication to the RS-Bus decoders. More information can be found in the
-  library.
+  - PIO 1 is in use in the RS-Bus master library to implement the rsbus interface for communication to the RS-Bus decoders. More information can be
+    found in the library.
   - PIO 2 is in use in the Xpressnet RS485 module to implement a 9-bits Uart for the communication with the slave devices.
 
 - One of the onboard ADC channel is used for the detection of a shortcircuit on the DCC signal and for the etection of een DCC Ack pulse as a reposne of a programming action. However due to hardware related issues this is currently disbaled and not working.
 
 ### Software Versions
 
-There will be at least two versions, Version-1 and version-2. Version-1 is developed for the first LZ210 hardware, which is only used for internal testing purposes. Version-2 will be made available when the version-2 hardware becomes available, Some modifications need to be made to provide for full functionality of the version-2 hardware. Currently software version 1 is stored in the repository. This software can not be used on the TMC-LZ210 Hardware described in the TMC-LZ210-Command-station-PCB repository without modification. As soon as the hardware is available the software will be modified according the new hardware and tested. Only Then the version-2 software will be made available.
-
-Further development will only be done on version-2 software, and intime bug fix releases will be available.
+There will be at least two versions, Version-1 and version-2. Version-1 is developed for the first LZ210 hardware, which is only used for internal testing purposes. Version-2 will be made available when the version-2 hardware becomes available, Some modifications need to be made to provide for full functionality of the version-2 hardware.  Version_1 software can not be used on the TMC-LZ210 Hardware described in the TMC-LZ210-Command-station-PCB repository without modification. For the latest board the Version-2 Software should be used. 
+Further development will only be done on version-2 software, and bug fix releases will be available.
 
 ## Software Configuration
 
@@ -201,22 +220,41 @@ The LZ210 provides a webserver where several configuration parameters kan be cha
 The figure above provides an example of the webpage. In the figure kan be seen that several entries are foreseen:
 
 - **system**
+
   - Factory reset
-  - System parameters
+  - System 
   - Internet
   - LenzLan
+  - Loconet-over_TCP
   - Z21
   - Web interface
+  - Debug Log
 
 - **Configuration**
+
   - DCC-HAL
+  - Power rails
   - RSbus-HAL
   - Xpressnet
 
 - **Tables**
+
   - Locomotives
+  - Loconet Slots
   - Turnouts
   - Feedback
 
-The Last entry, the tables, provide information about the locomitves, Turnouts, and the feedback decoders. No Configuration is possible.
-See the website itself for detailed configuration parameters.
+The Last entry, the tables, provides information about the locomotives, Loconet Slots,  Turnouts, and the Feedback decoders. No Configuration is possible here, it is only possible to clear the lists. See the website itself for detailed configuration parameters.
+
+## First Time Use
+
+The LZ210 Version-2 Hardware is build around the olimex Pico2 XL development board, therefore this board should be selected in as the board for the LZ210 in the tools menu from the arduino IDE. Use is made of the board package that has to be selected is the **olimex Pico2 XL by Earl Philhower, III**.
+The LZ210 also uses a file system for the flash storage of configuration parameters, therefore this should be configured in the arduino-ide as well.  In the Arduino IDE select **Tools - Flash Size** and select minimal **2MB(Sketch: 1920KB, FS: 128KB)**. In order to operate normally, the **Tools - CPU Speed:** should be set **150 MHz**, no overclocking is used nor required. Setting the clock speed to a different value will cause erratic behavior.
+
+During the first LZ210 starts-up it will store default configuration values in the flash filesystem. These configuration parameters can later be modified in the webpages. The configuration parameters will be described in a seperate document.
+
+When the power is connected to the LZ210, the builtin LED and the red status LED will start flashing indicating the LZ210 is starting-up. After Start-up, the LZ210 enters the power-off mode. In order to bring the LZ210 to the operation state, a power-on command should be given via either a ROCO multimouse or a Lenz LH100 handheld. In Fact it should be possible to use any Handheld connected via Xpressnet RS-485, but only these two are tested. Another way to set the LZ210 in the operational mode is connecting a PC via the available ethernet connector, and use a program like RocRail to send a Power-On command with  Xpressnet over TCP, Xpressnet over USB or Z21 connection. In case the LZ210 is in a operatioonal mode the red status LED and the builtin LED will burn steady. In this case the LZ210 is sending its DCC SIgnals over the DCC main Port and the booster ports. The state, Power-on or power-off,  in which the LZ210 starts-up is configurable via the website. 
+
+The LZ210 board provides several LEDS. The red late is the general status led. Other leds provide information if communication protocols are used, i.e if DCC traffic is present, Xpressnet traffic is ongoing, etc.  See the board Layout for the meeaning of the LEDs. ( due to a miscalculation in the hardware version 2 and 2.1 , the DCC  function is handled by the xpressnet LED as well and the red LED is STATUS, this will be solved in the next revision of the Hardware)
+
+The LZ210 has a serial debug port. Connecting a serial to USB converter to this port, with the following parameters Baudrate 112500, databits 8 , no parity, some logging is performed on a local terminal like putty or the provided QT tracelog program. Another way to receive extended information from the LZ210 is by using a terminal program like putty in raw mode on port 23456. Thsi provides access to the trace/LOG function of the LZ210. detailed information on the internal functions of the LZ210. Several parameters to control this function can be changed on the Debug Log page of the LZ210.

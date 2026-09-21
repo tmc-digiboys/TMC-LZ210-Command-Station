@@ -8,6 +8,8 @@
 #include "lenz_usb.h"
 #include "trace_log.h"
 #include "rs_bus_hal.h"
+#include "eeprom_store.h"
+#include "serial_config.h"
 
 // Global instance used by all modules and the EventBus handler
 LenzUsb gLenzUsb;
@@ -23,7 +25,16 @@ LenzUsb gLenzUsb;
 //  are forwarded to the connected PC as Lenz LAN broadcasts.
 // ─────────────────────────────────────────────────────────────
 void LenzUsb::begin() {
-    Serial.begin(LENZ_USB_BAUD);
+    // "usb.baud"/"usb.databits"/"usb.parity"/"usb.stopbits" (web
+    // interface, USB/Serial panel) — configurable per operator need
+    // (e.g. Rocrail's default of 57600, which also happens to match
+    // LENZ_USB_BAUD's own default). Note: this is native USB CDC
+    // (TinyUSB) — most CDC-ACM drivers only report/track these
+    // settings rather than actually rate-/frame-limiting transfer by
+    // them, so this mainly exists for client software that insists on
+    // specific values rather than because the link itself needs it.
+    Serial.begin(eepromStore().getUint32("usb.baud", LENZ_USB_BAUD),
+                 serialConfigFromEeprom("usb"));
     _rxLen        = 0;
     _progMode     = false;
     _hasActivity  = false;
@@ -316,10 +327,29 @@ void LenzUsb::_processFrame(const uint8_t* buf, uint8_t len) {
 //  flush — the same reasoning applied during the LenzLAN refactor.
 //  Does nothing if len is zero.
 // ─────────────────────────────────────────────────────────────
+// _sendRaw() — write raw bytes to the USB CDC port.
+//
+// Deliberately does NOT call Serial.flush() after every write. This
+// used to (Rob, confirmed via TraceLog + reproduction: driving errors
+// starting the exact moment the first LocoNet sensor triggers) —
+// individual RS-Bus/LocoNet feedback changes are each published as
+// their own separate Ev::feedback() event (see SlotServer::
+// _handleInputRep()'s comment — not batched like FEEDBACK_BULK), so a
+// burst of sensor activity (e.g. right as a train enters the first
+// occupied block) meant a burst of individual _sendRaw() calls here,
+// each blocking on flush() until the USB stack had actually finished
+// transmitting that one small packet — stalling core1 (where LenzUsb,
+// LocoNet, and everything else sharing this core runs) for long
+// enough to delay/drop the driving commands Rocrail was sending over
+// this exact same USB link at the same time. Native USB CDC (TinyUSB)
+// transmits queued Serial.write() data in the background regardless —
+// flush() only forces this function to wait for that background send
+// to finish before returning, which isn't needed for correctness (no
+// data is lost by not waiting), only for making one particular send
+// synchronous — not worth the cost paid on every single one of these.
 void LenzUsb::_sendRaw(const uint8_t* buf, uint8_t len) {
     if (len == 0) return;
     Serial.write(buf, len);
-    Serial.flush();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -396,18 +426,66 @@ void LenzUsb::onEvent(const Event& ev) {
         return;
     }
 
-    // Forward a single RS-Bus feedback pair as a BC "Rückmeldung" packet (N=2 → 0x42)
+    // Forward a single RS-Bus/LocoNet feedback change as a BC
+    // "Rückmeldung" packet (N=2 → 0x42). LocoNet-derived feedback
+    // (this branch) goes through _setFeedbackBitStepped() rather than
+    // a direct translation — see that function's own comment for why:
+    // it applies the same confirmed +1 bit-shift LenzLan already
+    // applies for LocoNet sensors (Rob, confirmed via tcpdump +
+    // Rocrail's own log — without it, Rocrail over USB was reporting
+    // the wrong sensor for every LocoNet-derived event, one address
+    // off, while Ethernet/Z21/LocoNet's own decode were all already
+    // correct). RS-Bus-derived feedback is unaffected — RS-Bus always
+    // publishes via the separate EvType::FEEDBACK_BULK branch above,
+    // which this does not touch.
     if (ev.type == EvType::FEEDBACK) {
-        // Module address is 0-based in this protocol byte per
-        // XpressNet spec §2.1.11 — see LenzLan::onEvent()'s own
-        // comment on the identical fix there for the full rationale.
-        uint8_t addrByte = (ev.fbModule - 1) & 0x7F;
-        uint8_t dataByte = 0x40 | (ev.fbNibble ? 0x10 : 0x00) | (ev.fbDat & 0x0F);
-        uint8_t kennung  = 0x42;  // N=2 (one pair)
-        uint8_t xorVal   = kennung ^ addrByte ^ dataByte;
-        uint8_t pkt[] = { 0xFF, 0xFD, kennung, addrByte, dataByte, xorVal };
-        _sendRaw(pkt, sizeof(pkt));
+        uint16_t rawBase = (uint16_t)(ev.fbModule - 1) * 8 + (ev.fbNibble ? 4 : 0);
+        uint8_t  dat     = ev.fbDat & 0x0F;
+        for (uint8_t b = 0; b < 4; b++) {
+            _setFeedbackBitStepped(rawBase + b + 1, (dat & (1 << b)) != 0);
+        }
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  _setFeedbackBitStepped() — sets one bit, at a GLOBAL, continuous
+//  bit position (module byte = pos/8, bit-within-byte = pos%8) across
+//  the whole _lastSentNibble[] cache, to the given state — and, only
+//  if this actually changes that bit, sends the resulting, complete
+//  4-bit nibble containing it as a single XpressNet feedback packet
+//  over USB.
+//
+//  Mirrors LenzLan::_setFeedbackBitStepped() (lenz_lan.cpp) exactly —
+//  see that function's own comment for the full rationale behind
+//  treating _lastSentNibble[128] as one continuous 1024-bit space
+//  (letting a +1-shifted bit land in a different module/nibble than
+//  the raw LocoNet event's own) and for only sending on an actual
+//  change. The one difference from LenzLan's version: no TCP
+//  backpressure/_txBusy queueing exists for this USB link, so this
+//  sends directly via _sendRaw() rather than going through a
+//  queue-or-send-now branch.
+// ─────────────────────────────────────────────────────────────
+void LenzUsb::_setFeedbackBitStepped(uint16_t globalBitPos, bool state) {
+    uint16_t byteIdx = globalBitPos / 8;
+    uint8_t  bitIdx  = globalBitPos % 8;
+    if (byteIdx >= sizeof(_lastSentNibble)) return;  // out of the 128-module range
+
+    uint8_t mask    = 1 << bitIdx;
+    bool    current = (_lastSentNibble[byteIdx] & mask) != 0;
+    if (current == state) return;  // already at this value — nothing to send
+
+    if (state) _lastSentNibble[byteIdx] |= mask;
+    else       _lastSentNibble[byteIdx] &= (uint8_t)~mask;
+
+    bool    nibbleFlag = bitIdx >= 4;
+    uint8_t nibbleVal  = nibbleFlag ? (_lastSentNibble[byteIdx] >> 4)
+                                    : (_lastSentNibble[byteIdx] & 0x0F);
+    uint8_t addrByte   = (uint8_t)byteIdx;
+    uint8_t dataByte   = 0x40 | (nibbleFlag ? 0x10 : 0x00) | nibbleVal;
+    uint8_t kennung    = 0x42;  // N=2 (one pair)
+    uint8_t xorVal     = kennung ^ addrByte ^ dataByte;
+    uint8_t pkt[]      = { 0xFF, 0xFD, kennung, addrByte, dataByte, xorVal };
+    _sendRaw(pkt, sizeof(pkt));
 }
 
 // ─────────────────────────────────────────────────────────────

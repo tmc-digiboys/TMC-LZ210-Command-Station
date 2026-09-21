@@ -59,6 +59,14 @@ private:
     // Interface-local layer (see xn_interface_layer.h)
     XnInterfaceLayer _ifLayer;
 
+    // Per-module last-sent nibble-pair cache for LocoNet-derived
+    // feedback — see _setFeedbackBitStepped()'s own comment
+    // (lenz_usb.cpp) for the full rationale; mirrors LenzLan's own
+    // identically-purposed _lastSentNibble (lenz_lan.h) exactly, so
+    // both transports apply the same confirmed +1 bit-shift and send
+    // logic for LocoNet sensors.
+    uint8_t _lastSentNibble[128] = {};
+
     // USB is a single serial link — there is no socket pool like
     // Ethernet has. Always reports 1 "free connection" when nothing
     // is currently active, 0 when that one link is already in use.
@@ -68,11 +76,13 @@ private:
     // Parses and dispatches one complete LAN frame
     void _processFrame(const uint8_t* buf, uint8_t len);
 
-    // Low-level primitive: writes raw bytes to Serial and flushes
-    // immediately afterwards. All other send paths (_sendFrame, the
-    // keep-alive reply, the RS-Bus dump, onEvent feedback) go through
-    // this function, so the flush behaviour is defined in exactly one
-    // place.
+    // Low-level primitive: writes raw bytes to Serial. Native USB CDC
+    // transmits queued writes in the background regardless — no
+    // explicit flush needed (and deliberately not done — see this
+    // function's own comment in lenz_usb.cpp). All other send paths
+    // (_sendFrame, the keep-alive reply, the RS-Bus dump, onEvent
+    // feedback) go through this function, so the send behaviour is
+    // defined in exactly one place.
     void _sendRaw(const uint8_t* buf, uint8_t len);
 
     // Sends an XpressNet frame with LAN header over USB serial
@@ -80,6 +90,14 @@ private:
 
     // Sends an XpressNet frame as a broadcast over USB serial
     void _sendBroadcast(const XnFrame& f);
+
+    // Sets one bit, at a GLOBAL, continuous bit position, in
+    // _lastSentNibble — and, only if this actually changes that bit,
+    // sends the resulting, complete 4-bit nibble containing it as a
+    // single XpressNet feedback packet over USB. See lenz_usb.cpp for
+    // the full rationale — mirrors LenzLan::_setFeedbackBitStepped()
+    // exactly (same confirmed +1 shift for LocoNet-derived feedback).
+    void _setFeedbackBitStepped(uint16_t globalBitPos, bool state);
 
     // Returns the length of the next complete frame, or 0 if incomplete
     static uint8_t _frameLen(const uint8_t* buf, uint8_t available);
