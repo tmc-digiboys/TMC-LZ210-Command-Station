@@ -37,6 +37,23 @@ DccHal gDccHal;
 // Static pointer for use in notify callbacks (no 'this' pointer available)
 static DccHal* _instance = nullptr;
 
+// Shadow of the DCCPacketScheduler library's own internal railpower
+// state, used by notifyRailpower()'s dedup check (see that function,
+// near the bottom of this file) to avoid re-publishing an unchanged
+// state as a fresh EventBus transition. Declared here (rather than
+// local to notifyRailpower()) so emergencyStop() can also update it —
+// see emergencyStop()'s own comment for why this is needed: the
+// library's ESTOP state is deliberately excluded from ever calling
+// notifyRailpower() at all (rails stay powered through an emergency
+// stop), so without emergencyStop() keeping this shadow in sync
+// itself, a POWER_ON that follows an emergency stop would wrongly
+// look unchanged to notifyRailpower() (this variable would still say
+// "ON" from before the emergency stop ever happened) and silently
+// fail to broadcast "operations resumed" to any clients — confirmed,
+// Rob: exactly this was leaving the LH100 waiting indefinitely after
+// resuming from a STOP.
+static uint8_t sLastRailpowerState = 0xFF;  // 0xFF = not yet known, forces the first real call through
+
 // ─────────────────────────────────────────────────────────────
 //  _checkCdeShort() — poll the CDE E-signal voltage and act on it
 //
@@ -280,15 +297,14 @@ void DccHal::_checkHBridgeFault(HBridgeFault& fb) {
 void DccHal::begin() {
     _instance = this;
 
-    // v2 hardware: the four rail-power enable signals (DCC main, CDE,
-    // LocoNet booster, programming track). All start LOW/disabled —
-    // track power is off at boot until an explicit power-on command
-    // — and are subsequently driven together by setPower() (see its
-    // comment for the full lifecycle, including why HW_SM_ACTIVE
-    // follows power-on/off too rather than staying off by default).
+    // v2 hardware: the three rail-power enable signals (DCC main, CDE,
+    // programming track). All start LOW/disabled — track power is off
+    // at boot until an explicit power-on command — and are
+    // subsequently driven together by setPower() (see its comment for
+    // the full lifecycle, including why HW_SM_ACTIVE follows
+    // power-on/off too rather than staying off by default).
     pinMode(HW_DCC_ACTIVE, OUTPUT); digitalWrite(HW_DCC_ACTIVE, LOW);
     pinMode(HW_CDE_ACTIVE, OUTPUT); digitalWrite(HW_CDE_ACTIVE, LOW);
-    pinMode(HW_LN_ENABLE,  OUTPUT); digitalWrite(HW_LN_ENABLE,  LOW);
     pinMode(HW_SM_ACTIVE,  OUTPUT); digitalWrite(HW_SM_ACTIVE,  LOW);
     _serviceModeRequested = false;
     _serviceModeStartMs   = 0;
@@ -408,11 +424,11 @@ void DccHal::_applySwitchMode() {
 //  so while a genuine service-mode operation (dedicated
 //  programming-track CV read/write — NOT Programming On Main, which
 //  needs no output switching at all, see setPower()'s comment)
-//  is in progress, HW_DCC_ACTIVE/HW_CDE_ACTIVE/HW_LN_ENABLE are
-//  temporarily disabled, leaving only the programming track
-//  (HW_SM_ACTIVE) carrying that packet stream — otherwise
-//  service-mode packets, which are not addressed to any one loco,
-//  would reach every loco on the whole layout simultaneously.
+//  is in progress, HW_DCC_ACTIVE/HW_CDE_ACTIVE are temporarily
+//  disabled, leaving only the programming track (HW_SM_ACTIVE)
+//  carrying that packet stream — otherwise service-mode packets,
+//  which are not addressed to any one loco, would reach every loco
+//  on the whole layout simultaneously.
 //
 //  Unlike an earlier design, this is no longer driven by polling
 //  isInServiceMode() every cycle — that value turned out to
@@ -431,7 +447,7 @@ void DccHal::_applySwitchMode() {
 //  has been open longer than SERVICE_MODE_TIMEOUT_MS (EEPROM
 //  "dcc.svc_timeout_ms"), it is force-closed via
 //  _exitServiceMode(false, 0, 0) — otherwise HW_DCC_ACTIVE/
-//  HW_CDE_ACTIVE/HW_LN_ENABLE, and the rest of the layout, would stay
+//  HW_CDE_ACTIVE, and the rest of the layout, would stay
 //  dark indefinitely.
 // ─────────────────────────────────────────────────────────────
 void DccHal::loop() {
@@ -618,15 +634,19 @@ void DccHal::_onCommand(const Command& cmd) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  _setMainOutputs() — drives HW_DCC_ACTIVE, HW_CDE_ACTIVE and
-//  HW_LN_ENABLE together (v2 hardware only). See the declaration in
-//  dcc_hal.h for the full reasoning on why these three are grouped
-//  and HW_SM_ACTIVE is handled separately.
+//  _setMainOutputs() — drives HW_DCC_ACTIVE and HW_CDE_ACTIVE
+//  together (v2 hardware only). See the declaration in dcc_hal.h for
+//  the full reasoning on why these two are grouped and HW_SM_ACTIVE
+//  is handled separately.
+//
+//  (HW_LN_ENABLE used to be driven here too, for the LocoNet
+//  booster's driver-chip enable signal — removed, Rob: a hardware
+//  revision to that booster dropped this signal, it's no longer
+//  wired to anything.)
 // ─────────────────────────────────────────────────────────────
 void DccHal::_setMainOutputs(bool on) {
     digitalWrite(HW_DCC_ACTIVE, on ? HIGH : LOW);
     digitalWrite(HW_CDE_ACTIVE, on ? HIGH : LOW);
-    digitalWrite(HW_LN_ENABLE,  on ? HIGH : LOW);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -670,12 +690,12 @@ void DccHal::_exitServiceMode(bool ok, uint16_t cv, uint8_t value) {
 // ─────────────────────────────────────────────────────────────
 //  setPower() — turn track power on or off
 //
-//  Updates the DCC library power state, drives all four v2 H-bridge
+//  Updates the DCC library power state, drives all three v2 H-bridge
 //  enable signals, publishes a POWER_ON/OFF event on the EventBus,
 //  and updates the OLED display and status LED.
 //
-//  v2 hardware note: all four rail-power enable signals
-//  (HW_DCC_ACTIVE/HW_CDE_ACTIVE/HW_LN_ENABLE/HW_SM_ACTIVE) follow
+//  v2 hardware note: all three rail-power enable signals
+//  (HW_DCC_ACTIVE/HW_CDE_ACTIVE/HW_SM_ACTIVE) follow
 //  overall track power together. HW_SM_ACTIVE (the dedicated
 //  programming-track output) is included here — deliberately, unlike
 //  an earlier design — specifically so a layout's isolated
@@ -739,9 +759,18 @@ void DccHal::emergencyStop() {
     // Track power itself is unaffected by an emergency stop — the DCC
     // signal keeps running (see the DCCInterfaceMaster-TMC library's
     // own ESTOP definition and setpower(): "no Loco drive but rails
-    // have power"). The library itself now correctly excludes ESTOP
-    // from its notifyRailpower() callback for exactly that reason —
-    // no suppression needed on this side of that boundary any more.
+    // have power"). The library itself correctly excludes ESTOP from
+    // its notifyRailpower() callback for exactly that reason.
+    //
+    // But the library's own internal `railpower` variable DOES still
+    // get set to ESTOP (just without notifying) — so we mirror that
+    // here in our own shadow (sLastRailpowerState), otherwise the next
+    // genuine POWER_ON (resuming from this stop) would look unchanged
+    // to notifyRailpower()'s own dedup check (it would still say "ON"
+    // from before this emergency stop ever happened) and silently
+    // fail to broadcast "operations resumed" — confirmed, Rob: this
+    // was leaving the LH100 waiting indefinitely after a resume.
+    sLastRailpowerState = ESTOP;
     _dcc.eStop();
     EventBus::instance().publish(Ev::estop(ModuleId::DCC_HAL));
     _inEmergencyStop = true;
@@ -910,7 +939,7 @@ void DccHal::setAccessory(uint16_t addr, uint8_t output, bool active) {
 // Read a CV from the programming track (service mode, requires ACK).
 // v2 hardware: explicitly and immediately switches the shared H-bridge
 // outputs to the dedicated programming track only (HW_DCC_ACTIVE/
-// HW_CDE_ACTIVE/HW_LN_ENABLE disabled, HW_SM_ACTIVE left on) — a
+// HW_CDE_ACTIVE disabled, HW_SM_ACTIVE left on) — a
 // one-shot decision made HERE, at the deliberate start of a session,
 // not re-evaluated every loop() cycle. See _serviceModeRequested's
 // comment in dcc_hal.h for why. Only actually switches if not already
@@ -1056,7 +1085,6 @@ void DccHal::notifyAck() {
 // re-confirmations into a fresh POWER_ON broadcast to every connected
 // client — a continuous flood after a single genuine power-on command.
 // Only publish when the state actually differs from the last call.
-static uint8_t sLastRailpowerState = 0xFF;  // 0xFF = not yet known, forces the first real call through
 void notifyRailpower(uint8_t state) {
     if (state == sLastRailpowerState) return;  // unchanged — library re-confirming, not a real transition
     sLastRailpowerState = state;

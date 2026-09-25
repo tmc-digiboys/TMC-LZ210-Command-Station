@@ -587,12 +587,19 @@ XNHandleResult XpressNetHandler::handlePowerOn(uint8_t* r, uint8_t& l) {
         l = buildError(r, 0x1F); return XNHandleResult::REPLY;
     }
 
-    // Direct, unconditional confirmation to the requesting client —
-    // see comment above for why this must not depend on whether the
-    // state actually changed. Any broadcast to OTHER clients is still
-    // handled separately, and still deduplicated, via DccHal.
-    r[0]=0x61; r[1]=0x01; r[2]=xorCheck(r,2); l=3;
-    return XNHandleResult::REPLY;
+    // Broadcast-only, no separate direct reply — tried (Rob, LSA
+    // comparison): sending both a direct reply AND the broadcast
+    // (previous version of this function) still left the LH100
+    // waiting a long time to resume after a STOP, while DCC-EX sends
+    // only the broadcast (its own reply here uses a broadcast-style
+    // call byte, address field 0, not an addressed reply to the
+    // polled slave) and its LH100 proceeds within milliseconds. The
+    // broadcast itself is already handled via DccHal's own
+    // notifyRailpower() -> EventBus -> XpressNetRs485::_onEvent()
+    // chain (see that function's own comment), triggered by the
+    // CommandBus dispatch above — nothing else to send here.
+    l = 0;
+    return XNHandleResult::BROADCAST_ONLY;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -627,10 +634,24 @@ XNHandleResult XpressNetHandler::handleEmergStop(uint8_t* r, uint8_t& l) {
     if (!CommandBus::instance().dispatch(cmd)) {
         l = buildError(r, 0x1F); return XNHandleResult::REPLY;
     }
+    // NO_REPLY, not REPLY or BROADCAST_ONLY — tried both of those
+    // (Rob, LSA comparison against a Z21PG-style reference
+    // implementation): REPLY (direct "81 00" + a later broadcast) was
+    // slow to resume; BROADCAST_ONLY (no direct reply, but forces an
+    // IMMEDIATE _flushBroadcasts() call right here) made it worse.
+    // The reference implementation's own handling of this exact
+    // opcode sends NOTHING directly at all in response — just updates
+    // internal status and lets an app-level callback (asynchronous,
+    // not forced-immediate) handle any broadcast. broadcastEmergencyStop()
+    // below still queues the "81 00" broadcast as before — this just
+    // no longer forces an immediate flush of that queue from within
+    // this specific handler call, letting it go out on the normal,
+    // already-existing periodic broadcast-flush cycle instead (the
+    // same way an ordinary loco-speed-triggered broadcast already
+    // does, with no special-casing).
     broadcastEmergencyStop();
-    // Send emergency stop status as a direct response
-    r[0]=0x81; r[1]=0x00; r[2]=xorCheck(r,2); l=3;
-    return XNHandleResult::REPLY;
+    l = 0;
+    return XNHandleResult::NO_REPLY;
 }
 
 // ─────────────────────────────────────────────────────────────

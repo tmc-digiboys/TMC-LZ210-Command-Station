@@ -163,10 +163,10 @@ constexpr uint8_t CDE_ADC_SETTLE_READS = 8;
 // arrived within this many milliseconds of cvRead()/cvWrite() being
 // called, loop() forces the session closed and reports a failure, so
 // a session that never gets a result (no decoder present, no ACK
-// detected, etc.) cannot leave HW_DCC_ACTIVE/HW_CDE_ACTIVE/
-// HW_LN_ENABLE disabled — and the rest of the layout dark —
-// indefinitely. Configurable via EEPROM key "dcc.svc_timeout_ms"
-// (web interface); this constant is only the fallback default.
+// detected, etc.) cannot leave HW_DCC_ACTIVE/HW_CDE_ACTIVE disabled —
+// and the rest of the layout dark — indefinitely. Configurable via
+// EEPROM key "dcc.svc_timeout_ms" (web interface); this constant is
+// only the fallback default.
 constexpr uint32_t SERVICE_MODE_TIMEOUT_MS = 3000;
 
 class DccHal : public HardwareModule {
@@ -190,12 +190,12 @@ public:
     void loop()  override;
 
     void usedPins(const uint8_t*& pins, uint8_t& count) const override {
-        static uint8_t p[14];
+        static uint8_t p[13];
         p[0]=_pinDcc; p[1]=_pinDcc2; p[2]=_pinEn; p[3]=_pinCde;
-        p[4]=HW_DCC_ACTIVE; p[5]=HW_CDE_ACTIVE; p[6]=HW_LN_ENABLE; p[7]=HW_SM_ACTIVE;
-        p[8]=HW_DCC_FAULT; p[9]=HW_SM_FAULT; p[10]=HW_CDE_FAULT;
-        p[11]=HW_DCC_SENSE; p[12]=HW_SM_SENSE; p[13]=HW_CDE_SENSE;
-        pins = p; count = 14;
+        p[4]=HW_DCC_ACTIVE; p[5]=HW_CDE_ACTIVE; p[6]=HW_SM_ACTIVE;
+        p[7]=HW_DCC_FAULT; p[8]=HW_SM_FAULT; p[9]=HW_CDE_FAULT;
+        p[10]=HW_DCC_SENSE; p[11]=HW_SM_SENSE; p[12]=HW_CDE_SENSE;
+        pins = p; count = 13;
     }
 
     // Emergency reset — turns off track power immediately
@@ -243,6 +243,16 @@ public:
     const HBridgeFault&     faultDcc() const { return _faultDcc; }
     const HBridgeFault&     faultSm()  const { return _faultSm;  }
     const HBridgeFault&     faultCde() const { return _faultCde; }
+
+    // Resets all three bridges' nFAULT counters (raw + debounced) —
+    // see HBridgeFault::resetFaultCounts()'s own comment. Web
+    // interface's "Reset nFAULT counters" button (H-bridge status
+    // table) is the only caller.
+    void resetHBridgeFaultCounts() {
+        _faultDcc.resetFaultCounts();
+        _faultSm.resetFaultCounts();
+        _faultCde.resetFaultCounts();
+    }
     const DccCurrentMonitor& senseDcc() const { return _senseDcc; }
     const DccCurrentMonitor& senseSm()  const { return _senseSm;  }
     const DccCurrentMonitor& senseCde() const { return _senseCde; }
@@ -320,21 +330,21 @@ private:
     // Checks the CDE short-circuit flag and triggers power-off if set
     void _checkCdeShort();
 
-    // v2 hardware: drives HW_DCC_ACTIVE, HW_CDE_ACTIVE and
-    // HW_LN_ENABLE together — the three "normal operation" rail-power
-    // enable signals. Used both by setPower() (all three follow
-    // overall track power) and by loop()'s service-mode transition
-    // handling (all three get temporarily disabled while genuine
-    // service-mode programming is active — see loop() for the full
-    // reasoning). Deliberately does NOT touch HW_SM_ACTIVE, which
-    // follows a different lifecycle (tied only to setPower(), staying
-    // on throughout a service-mode session — see setPower()'s comment).
+    // v2 hardware: drives HW_DCC_ACTIVE and HW_CDE_ACTIVE together —
+    // the two "normal operation" rail-power enable signals. Used both
+    // by setPower() (both follow overall track power) and by loop()'s
+    // service-mode transition handling (both get temporarily disabled
+    // while genuine service-mode programming is active — see loop()
+    // for the full reasoning). Deliberately does NOT touch
+    // HW_SM_ACTIVE, which follows a different lifecycle (tied only to
+    // setPower(), staying on throughout a service-mode session — see
+    // setPower()'s comment).
     void _setMainOutputs(bool on);
 
     // v2 hardware: ends the current service-mode session (called from
     // notifyCVVerify()/notifyCVNack() on a definite result, or from
     // loop() on timeout with no result at all). Restores
-    // HW_DCC_ACTIVE/HW_CDE_ACTIVE/HW_LN_ENABLE (only if track power is
+    // HW_DCC_ACTIVE/HW_CDE_ACTIVE (only if track power is
     // still on — no-op otherwise), clears _serviceModeRequested, and
     // updates gCentrale's programming-mode bookkeeping so
     // XpressNetHandler::handleProgResult() can report the outcome to

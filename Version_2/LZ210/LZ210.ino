@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// This is the implementation of the LZ210. In order to build the 
+// This is the implementation of the LZ210. 
 //
 // Building the LZ210 Software  
 //   For the LZ210 software, the following libraries are needed:
@@ -248,8 +248,8 @@ pinMode(HW_EXT_GPIO_6, OUTPUT);
 pinMode(HW_EXT_GPIO_7, OUTPUT);
 
 // H-Bridge / rail-power enable lines (HW_DCC_ACTIVE, HW_SM_ACTIVE,
-// HW_CDE_ACTIVE, HW_LN_ENABLE) are no longer statically initialised
-// here — DccHal::begin() now sets all four to their safe LOW/disabled
+// HW_CDE_ACTIVE) are no longer statically initialised here —
+// DccHal::begin() now sets all three to their safe LOW/disabled
 // startup state, and DccHal::setPower() drives them dynamically from
 // then on (together with the service-mode routing in DccHal::loop()).
 // See dcc_hal.cpp for the full lifecycle.
@@ -844,6 +844,13 @@ void _registerDefaultParams() {
     // Valid range matches that same fallback check: 1-31.
     store.registerUint8("xn.li_address", 1, ModuleId::LENZ_LAN);
     store.registerBool  ("rs485.enable", true,  ModuleId::XPRESSNET_RS485);
+    // See XN_PRESENCE_TIMEOUT_MS's comment in xpressnet_rs485.h for
+    // the full rationale and the tradeoff this balances. Default
+    // 10000ms — comfortably above the ~7-8s worst-case silence
+    // observed (Rob, LSA: an LH100 recovering from its own internal
+    // emergency-stop state), without being needlessly generous at
+    // other present handhelds' expense.
+    store.registerUint32("rs485.presence_to_ms", 10000, ModuleId::XPRESSNET_RS485);
     store.registerBool  ("rsbus.enable", true,  ModuleId::RS_BUS_HAL);
     // Delta filtering: newer feedback decoders already only report on a
     // genuine change themselves, making our own filter redundant for

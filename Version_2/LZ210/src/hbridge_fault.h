@@ -77,8 +77,23 @@ public:
     // flag is expected to already be clean. Every true return is also
     // recorded into the recent-fault history used by shouldEscalate()
     // below.
+    //
+    // Also maintains faultCountRaw() (below) — a SEPARATE count,
+    // incremented on every raw low-going transition, BEFORE the
+    // 3-sample debounce filter runs, so a single-sample glitch that
+    // never reaches faultCount() (the debounced count) still shows up
+    // there. Requested explicitly (Rob): the raw count is the more
+    // meaningful of the two for judging how electrically noisy a
+    // bridge's nFAULT line actually is — the debounced count alone can
+    // hide that, since several raw glitches close together collapse
+    // into at most one debounced edge (check() ignores the pin
+    // entirely while _wasLow is already true).
     bool check() {
         bool faultNow = (digitalRead(_pin) == LOW);
+
+        if (faultNow && !_wasRawLow) _faultCountRaw++;
+        _wasRawLow = faultNow;
+
         if (!faultNow) { _wasLow = false; _lowCount = 0; return false; }
         if (_wasLow) return false;          // already reported, still ongoing
         if (++_lowCount < 3) return false;  // debounce: 3 consecutive lows
@@ -171,11 +186,35 @@ public:
     // Short display name for this bridge ("DCC"/"SM"/"CDE").
     const char* name() const { return _name; }
 
+    // Cumulative counts of nFAULT edges seen since boot (or since the
+    // last resetFaultCounts() call) — for the web interface's
+    // H-bridge status table (Rob: wanted visibility into how often
+    // each bridge faults over time, not just its current state; also
+    // wanted the raw count specifically, not just the debounced one —
+    // see check()'s own comment for why). Purely in-RAM: starts at 0
+    // on every boot/reset — no EEPROM persistence, by design (asked
+    // for explicitly: counts across the board's uptime, resettable
+    // via a button, not meant to survive a power cycle).
+    //
+    // faultCountRaw(): every individual low-going transition on the
+    // pin, before the 3-sample debounce filter.
+    // faultCount(): only the edges that passed that filter (the same
+    // signal shouldEscalate() is built from) — NOT gated on whether
+    // that particular edge went on to escalate, so an isolated,
+    // harmless blip (see this class's own comment on why those are
+    // expected and normal) still increments this one too.
+    uint32_t faultCountRaw() const { return _faultCountRaw; }
+    uint32_t faultCount()    const { return _faultCount; }
+    void     resetFaultCounts() { _faultCount = 0; _faultCountRaw = 0; }
+
 private:
     uint8_t     _pin;
     const char* _name;
-    bool        _wasLow   = false;
-    uint8_t     _lowCount = 0;
+    bool        _wasLow     = false;
+    uint8_t     _lowCount   = 0;
+    bool        _wasRawLow  = false;
+    uint32_t    _faultCount    = 0;
+    uint32_t    _faultCountRaw = 0;
 
     // Small ring buffer of recent fault timestamps, used by
     // shouldEscalate() above to detect repeated faults within a
@@ -195,6 +234,7 @@ private:
     uint32_t _recoverSinceMs  = 0;
 
     void _recordFault() {
+        _faultCount++;
         _history[_historyHead] = millis();
         _historyHead = (_historyHead + 1) % HBRIDGE_FAULT_HISTORY;
     }

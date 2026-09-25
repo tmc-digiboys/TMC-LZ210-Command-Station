@@ -52,6 +52,22 @@ enum class XNSlaveType : uint8_t {
 #define XN_RS485_REPLY_US     500  // Reply timeout in µs (was 1000 — further lowered, towards DCC-EX's ~500µs)
 #define XN_RS485_MIN_US       40
 #define XN_INTER_POLL_US      150  // Inter-poll delay in µs (was 500 — further lowered)
+// Fallback default for "rs485.presence_to_ms" (web interface, RS485
+// panel) — used only if that key isn't registered/loadable. How long
+// a known-present slave may stay completely silent (no reply to any
+// poll) before being marked absent — see _pollSlave()'s own comment
+// for why this needs to be generous: a device can legitimately not
+// answer polls at all for several seconds (confirmed, Rob: an LH100
+// recovering from its own internal emergency-stop state) while still
+// being very much present and about to resume. But too generous wastes
+// poll turns on a genuinely disconnected device — round-robin sharing
+// turns evenly between all "present" devices, whether they're actually
+// answering or not, means a silent-but-still-present device stretches
+// out every OTHER present device's own polling interval too (confirmed
+// concern, Rob) for as long as it's tolerated. Made configurable
+// specifically to balance this tradeoff without needing a re-flash to
+// tune it.
+#define XN_PRESENCE_TIMEOUT_MS 10000
 #define XN_RS485_TX_SETTLE    10
 #define XN_RS485_BC_REPEAT    1
 #define XN_RS485_RX_BUF       32

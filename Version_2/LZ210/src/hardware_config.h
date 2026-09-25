@@ -28,7 +28,9 @@
 // ── LocoNet ───────────────────────────────────────────────────
 #define HW_LN_TX_PIN        0   // GPIO00  — LocoNet TX (geïnverteerd voor open-collector)
 #define HW_LN_RX_PIN        1   // GPIO01  — LocoNet RX
-#define HW_LN_ENABLE			 15
+// HW_LN_ENABLE (GPIO15, LocoNet booster driver-chip enable) removed —
+// a hardware revision to the LocoNet booster dropped this signal,
+// it's no longer wired to anything.
 
 // ── DCC uitgang ───────────────────────────────────────────────
 #define HW_DCC_PIN          32   // GPIO32 — DCC signaal uitgang

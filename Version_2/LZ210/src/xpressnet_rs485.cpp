@@ -1,5 +1,6 @@
 #include "xpressnet_rs485.h"
 #include "trace_log.h"
+#include "eeprom_store.h"
 
 XpressNetRs485 gXpressNetRs485;
 
@@ -420,7 +421,29 @@ void XpressNetRs485::_pollSlave(uint8_t addr) {
     }
 
     if (rxLen == 0) {
-        if (sl.present && ++sl.missCount > 10) {
+        // Time-based (not poll-count-based) absence threshold — a
+        // known-present device is only marked absent after
+        // XN_PRESENCE_TIMEOUT_MS of continuous silence, not after a
+        // fixed number of missed polls. Confirmed (Rob, LSA + trace):
+        // with the previous missCount>10 threshold, a device that goes
+        // briefly but genuinely silent — e.g. an LH100 recovering from
+        // its own internal emergency-stop state, seen staying quiet
+        // for several seconds even under continuous polling — was
+        // being marked absent after roughly 14ms (10 missed polls at
+        // ~1.3ms each), long before it was actually gone. Once marked
+        // absent, the round-robin "poll known-present devices" loop in
+        // _nextSlave() no longer finds it at all, so it falls back to
+        // the throttled 1-in-8 discovery scan across all 31 possible
+        // addresses — adding potentially hundreds of ms of further
+        // delay each time before its own address comes up again,
+        // compounding on top of whatever the device's own recovery
+        // time already was. missCount is kept (renamed conceptually to
+        // "informational only" here) purely for the web interface's
+        // own display of it — see the RS-Bus status table's equivalent
+        // — not for this absence decision any more.
+        sl.missCount++;
+        uint32_t timeoutMs = eepromStore().getUint32("rs485.presence_to_ms", XN_PRESENCE_TIMEOUT_MS);
+        if (sl.present && (millis() - sl.lastSeenMs) > timeoutMs) {
             sl.present   = false;
             sl.missCount = 0;
         }
@@ -512,7 +535,21 @@ void XpressNetRs485::_processSlaveReply(uint8_t addr,
         // the shared XpressNetHandler (power/estop/clock, 0x42 switching
         // info, 0xE4 loco status, 0x63 CV programming result, etc).
         // enqueueBroadcast() itself enforces the maximum frame length.
-        sRs485Handler.setBroadcastCallback([](const uint8_t* data, uint8_t dlen, uint16_t /*locoAddr*/) {
+        sRs485Handler.setBroadcastCallback([](const uint8_t* data, uint8_t dlen, uint16_t locoAddr) {
+            // Per-loco broadcasts (locoAddr != 0 — e.g. the loco-info
+            // broadcast handleLocoFunc() sends after a function-key
+            // change) are deliberately NOT forwarded on RS485.
+            // Confirmed against the Z21PG reference implementation
+            // (Rob): for this command class it sends nothing back at
+            // all over RS485, no direct reply and no broadcast either
+            // — sending one anyway (even alongside a correct direct
+            // ack) was driving the LH100 into a genuine lock-up
+            // (Programming Mode, needing a hard power-cycle to clear).
+            // System-wide broadcasts (locoAddr==0 — power on/off,
+            // emergency stop) still go through unchanged; those were
+            // separately confirmed necessary (see handlePowerOn()'s
+            // own history in this file).
+            if (locoAddr != 0) return;
             gXpressNetRs485.enqueueBroadcast(data, dlen);
         });
         sRs485Init = true;
@@ -545,6 +582,18 @@ void XpressNetRs485::_processSlaveReply(uint8_t addr,
     if (r == XNHandleResult::BROADCAST_ONLY) {
         _flushBroadcasts();
     }
+    // OK_SILENT: deliberately nothing sent on RS485 — REVERTED an
+    // earlier attempt here to send the fixed "01 04 05" ack that
+    // LenzLan/LenzUsb do send for this same result (that alone didn't
+    // fix the underlying problem, a genuine LH100 lock-up needing a
+    // power-cycle to clear, and was based on an incorrect assumption).
+    // Confirmed against the Z21PG reference implementation itself
+    // (Rob): for this exact command class over RS485, it sends
+    // NOTHING back at all — no direct reply, no broadcast. See
+    // enqueueBroadcast()'s own callback above for the matching
+    // per-loco-broadcast skip.
+    // (intentionally: no branch for OK_SILENT here — falls through
+    // to the closing brace below, sending nothing)
 }
 
 // ─────────────────────────────────────────────────────────────

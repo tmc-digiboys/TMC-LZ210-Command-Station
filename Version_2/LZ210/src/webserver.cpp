@@ -188,6 +188,15 @@ void Webserver::_handleClient(EthernetClient& client) {
             _sendRedirect(client, "/?p=feedback");
             return;
         }
+        if (_pathEquals(req.path, "/clear/hfaults")) {
+            // Resets all three bridges' nFAULT counters (raw and
+            // debounced) — see HBridgeFault::resetFaultCounts()'s own
+            // comment: purely in-RAM, so this is the only way to zero
+            // them short of a reboot.
+            gDccHal.resetHBridgeFaultCounts();
+            _sendRedirect(client, "/?p=dcchal");
+            return;
+        }
         if (_pathEquals(req.path, "/loconet/dispatch")) {
             // Not an EepromStore parameter (a one-off action, not a
             // persisted setting), so parsed directly here rather than
@@ -1010,7 +1019,8 @@ void Webserver::_panelDccHal(EthernetClient& c) {
 
     c.print(F("<h3>H-bridge status</h3>"
               "<table><tr><th>Bridge</th><th>nFAULT</th>"
-              "<th>ACK state</th><th>SENSE (mV)</th><th>SENSE (raw ADC)</th></tr>"));
+              "<th>ACK state</th><th>SENSE (mV)</th><th>SENSE (raw ADC)</th>"
+              "<th>nFAULT count (raw)</th><th>nFAULT count (debounced)</th></tr>"));
     struct BridgeRow { const HBridgeFault* fault; const DccCurrentMonitor* sense; };
     BridgeRow rows[] = {
         { &gDccHal.faultDcc(), &gDccHal.senseDcc() },
@@ -1024,9 +1034,19 @@ void Webserver::_panelDccHal(EthernetClient& c) {
         c.print(F("</td><td>")); c.print(_ackStateName(row.sense->ackState()));
         c.print(F("</td><td>")); c.print(row.sense->lastMv());
         c.print(F("</td><td>")); c.print(row.sense->lastAdcValue());
+        c.print(F("</td><td>")); c.print(row.fault->faultCountRaw());
+        c.print(F("</td><td>")); c.print(row.fault->faultCount());
         c.print(F("</td></tr>"));
     }
-    c.print(F("</table>"));
+    c.print(F("</table>"
+              "<p class='hint'>Counts since the last boot/reset (raw: every "
+              "individual nFAULT low, before debouncing; debounced: only "
+              "the filtered edges — see the RS485/USB/LAN trace log). Not "
+              "persisted across a power cycle by design.</p>"
+              "<form method='POST' action='/clear/hfaults'>"
+              "<button class='btn' type='submit' "
+              "onclick=\"return confirm('Reset all nFAULT counters?')\">"
+              "Reset nFAULT counters</button></form>"));
     _shellClose(c);
 }
 
@@ -1080,6 +1100,21 @@ void Webserver::_panelRs485(EthernetClient& c) {
               "<input type='hidden' name='_p' value='rs485'>"));
     c.print(F("<fieldset><legend>RS485</legend>"));
     _printField(c, "rs485.enable", "Enabled");
+    c.print(F("</fieldset>"
+              "<fieldset><legend>Presence timeout</legend>"
+              "<p class='hint'>How long a known-present handheld may stay "
+              "completely silent (no reply to any poll) before being marked "
+              "absent and falling back to the slower, throttled discovery "
+              "scan. Needs to be generous enough to cover a device that "
+              "legitimately doesn't answer for a while (e.g. an LH100 "
+              "recovering from its own internal emergency-stop state can "
+              "stay silent for several seconds) — but too generous wastes "
+              "poll turns on a genuinely disconnected device, which slows "
+              "down every OTHER present handheld's own polling interval in "
+              "the meantime (round-robin polling shares turns evenly "
+              "between all devices marked present, whether they're actually "
+              "answering or not).</p>"));
+    _printField(c, "rs485.presence_to_ms", "Timeout (ms)");
     c.print(F("</fieldset><button class='btn'>Save</button></form>"));
     _shellClose(c);
 }
