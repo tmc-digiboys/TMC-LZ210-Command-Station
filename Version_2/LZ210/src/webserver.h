@@ -38,7 +38,7 @@
 #include <Ethernet.h>
 
 #define WEB_PORT          80    // HTTP listen port
-#define WEB_MAX_REQ_SIZE  512   // Maximum request body size (bytes)
+#define WEB_MAX_REQ_SIZE  2048  // Maximum request body size (bytes)
 #define WEB_MAX_CLIENTS   2     // Maximum simultaneous HTTP connections
 
 class Webserver : public ProtocolModule {
@@ -82,6 +82,24 @@ private:
 
     // Reads and parses one HTTP request. Returns false on timeout/error.
     bool _parseRequest(EthernetClient& client, HttpRequest& req);
+    // Reads one CRLF- (or bare LF-) terminated line into buf (up to
+    // maxLen-1 chars, null-terminated), waiting for more data to
+    // arrive whenever client.available() is momentarily false rather
+    // than treating that as end-of-input — client.available() only
+    // reports what the Ethernet chip has buffered so far, not whether
+    // more is coming, so a request split across multiple TCP segments
+    // (headers and body arriving separately, or even one header line
+    // split mid-line — both routine on a real network) was previously
+    // misread as "no more headers" partway through, leaving
+    // Content-Length never found and the body never read at all (see
+    // _parseRequest()'s own history for how this was found: EVERY
+    // settings save was silently doing nothing, not just one page).
+    // Bounded by an overall deadlineMs (absolute millis() value, not a
+    // duration) so a client that stops sending mid-request can't hang
+    // this function forever. Returns the number of characters read
+    // (0 for a blank line), or -1 if the deadline passed before a
+    // complete line arrived.
+    int16_t _readLine(EthernetClient& client, char* buf, uint8_t maxLen, uint32_t deadlineMs);
 
     // Parses a URL-encoded form body and updates EepromStore parameters
     void _parseFormBody(const char* body, uint16_t len);

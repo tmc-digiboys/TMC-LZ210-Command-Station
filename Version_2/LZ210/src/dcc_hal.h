@@ -54,6 +54,7 @@
 #include "hbridge_fault.h"
 #include "dcc_current_monitor.h"
 #include <DCCPacketScheduler_new.h>
+#include <DCCHardware.h>  // dccPacketEngine — enterInrushMode()/leaveInrushMode()/isInrushModeEnabled(), see _updateInrush()
 
 // ADC-based CDE short-circuit detection. Superseded the earlier
 // digital (digitalRead()) approach entirely: the E-signal's voltage
@@ -244,6 +245,12 @@ public:
     const HBridgeFault&     faultSm()  const { return _faultSm;  }
     const HBridgeFault&     faultCde() const { return _faultCde; }
 
+    // For the web interface's H-bridge status table — is the inrush
+    // state machine (see _updateInrush()) currently active, and for
+    // which bridge? Returns nullptr's name ("") when idle.
+    bool        inrushActive() const     { return _inrushBridge != nullptr; }
+    const char* inrushBridgeName() const { return _inrushBridge ? _inrushBridge->name() : ""; }
+
     // Resets all three bridges' nFAULT counters (raw + debounced) —
     // see HBridgeFault::resetFaultCounts()'s own comment. Web
     // interface's "Reset nFAULT counters" button (H-bridge status
@@ -393,6 +400,22 @@ private:
     HBridgeFault _faultDcc{HW_DCC_FAULT, "DCC"};
     HBridgeFault _faultSm {HW_SM_FAULT,  "SM"};
     HBridgeFault _faultCde{HW_CDE_FAULT, "CDE"};
+
+    // Inrush-protection state machine — see _updateInrush()'s own
+    // comment (dcc_hal.cpp) for the full algorithm. Only ever applies
+    // to whichever of DCC/SM is the currently ACTIVE output (they
+    // share the one PIO/DMA-generated DCC signal — see
+    // dccPacketEngine's own header comment on call order — so only one
+    // of them is ever actually driving anything at a time); CDE is not
+    // covered (Rob: only DCC and SM talk directly to locos, CDE
+    // doesn't). Idle (_inrushBridge == nullptr) most of the time.
+    bool          _inrushLowSense       = false;    // this attempt was started for a low-sense (suspected UVLO/CPUV/TSD) fault
+    HBridgeFault* _inrushBridge         = nullptr;  // which bridge this run is for, or nullptr when idle
+    uint32_t      _inrushStartMs        = 0;        // when this inrush attempt began
+    uint32_t      _inrushBurstStartMs   = 0;        // start of the current burst-check period
+    uint16_t      _inrushBurstCount     = 0;        // periods elapsed so far this attempt
+    uint32_t      _inrushShortSinceMs   = 0;        // when SENSE first crossed the short threshold, 0 = not currently crossing
+    void _updateInrush(bool dccEdge, bool smEdge);
 
     // Shared handler for all three HBridgeFault instances above —
     // called once per bridge from loop(). Checks for a newly detected

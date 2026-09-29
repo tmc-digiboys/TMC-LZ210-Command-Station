@@ -761,6 +761,12 @@ void _registerDefaultParams() {
         // that function's own comment in hbridge_fault.h.
         snprintf(key, sizeof(key), "%s.fault_clear_ms", p);
         store.registerUint32(key, 10,   ModuleId::DCC_HAL);
+        // Edge debounce: consecutive LOW loop() samples before a low
+        // counts as a fault edge — see HBridgeFault::check()'s comment.
+        // Samples, not time. Default 3 = the value that used to be
+        // hardcoded.
+        snprintf(key, sizeof(key), "%s.fault_debounce", p);
+        store.registerUint16(key, 3,    ModuleId::DCC_HAL);
     }
     store.registerString("net.subnet",   "255.255.255.0",      16, 0);
     store.registerBool  ("net.dhcp",     true,                     0);
@@ -872,6 +878,33 @@ void _registerDefaultParams() {
     // full rationale. Default false: keep the last-known state,
     // matching this project's original (pre-configurable) behaviour.
     store.registerBool  ("rsbus.clear_on_power", false, ModuleId::RS_BUS_HAL);
+    // Inrush-protection thresholds (DCC/SM bridges only) — see
+    // DccHal::_updateInrush()'s own comment for the full algorithm.
+    // Rob's own rough starting estimates — explicitly flagged as
+    // needing empirical, on-the-bench tuning, not calibrated values.
+    store.registerUint32("dcc.inrush_burst_ms",   2,    ModuleId::DCC_HAL);
+    store.registerUint16("dcc.inrush_max_bursts", 10,   ModuleId::DCC_HAL);
+    store.registerUint16("dcc.inrush_short_mv",   2500, ModuleId::DCC_HAL);
+    store.registerUint32("dcc.inrush_short_ms",   20,   ModuleId::DCC_HAL);
+    // Minimum SENSE reading (at fault-onset) for a fault to even be
+    // considered inrush — see _updateInrush()'s own comment on why
+    // (DRV8874/DRV8876 nFAULT is shared by UVLO/CPUV/OCP/TSD, and only
+    // OCP involves real current — a near-zero reading at a fault is
+    // almost certainly one of the other three, not inrush).
+    store.registerUint16("dcc.inrush_min_mv",     50,   ModuleId::DCC_HAL);
+    // What to do about a fault with sense below the minimum above (i.e.
+    // suspected UVLO/CPUV/TSD rather than overcurrent) — see
+    // DccHal::_updateInrush(). Mode 1 (fault storm only) is the
+    // default; cnt/ms define the storm; burst_ms/max are the timing
+    // used by an attempt started this way (defaults = the normal ones,
+    // untuned — an experiment, per Rob).
+    static const char* const kInrushLoOpts[] = {
+        "No - plain fault handling", "Only during a fault storm", "Yes - on every such fault", nullptr };
+    store.registerEnum  ("dcc.inrush_lo_mode",     ModuleId::DCC_HAL, 1, kInrushLoOpts);
+    store.registerUint8 ("dcc.inrush_lo_cnt",      5,    ModuleId::DCC_HAL);
+    store.registerUint32("dcc.inrush_lo_ms",       100,  ModuleId::DCC_HAL);
+    store.registerUint32("dcc.inrush_lo_burst_ms", 2,    ModuleId::DCC_HAL);
+    store.registerUint16("dcc.inrush_lo_max",      10,   ModuleId::DCC_HAL);
     // USB (LenzUsb, native USB CDC — XpressNet-over-USB, e.g. for
     // Rocrail) and debug/trace UART (Serial2) serial port settings —
     // see LenzUsb::begin(), setup()'s own comments, and

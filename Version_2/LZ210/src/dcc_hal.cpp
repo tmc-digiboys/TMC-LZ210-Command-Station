@@ -209,6 +209,218 @@ void DccHal::_checkCdeShort() {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  _updateInrush() — inrush-protection state machine for whichever of
+//  DCC/SM is currently the ACTIVE output (they share the one PIO/DMA
+//  DCC signal generator — dccPacketEngine — so only one is ever really
+//  driving anything: SM during a service-mode session, DCC main
+//  otherwise). CDE is intentionally NOT covered here (Rob: only DCC
+//  and SM talk directly to a loco's own decoder — a fresh rail
+//  contact's input-capacitor inrush, or a motor's back-EMF kickback as
+//  it stops, both confirmed by Rob to trip nFAULT harmlessly — CDE
+//  doesn't see that kind of transient the same way).
+//
+//  On a fresh fault edge on the active bridge, instead of treating it
+//  as an immediate fault (the plain edge-count/duration checks just
+//  below in loop() still do that, as an independent backstop), this
+//  switches dccPacketEngine into "inrush mode": a train of short
+//  (~2.5us) pulses too brief to trip the DRV887x's own OCP comparator,
+//  letting a decoder's input capacitor charge gradually instead of
+//  drawing one large, sustained inrush current. See DCCHardware_RP.inc
+//  (DCCInterfaceMaster-TMC library, Aiko Pras) for the actual waveform
+//  — this class only decides WHEN to start/stop it and for how long.
+//
+//  Distinguishing genuine inrush from a genuine short (both trip
+//  nFAULT the same way) per Rob's own description: inrush current
+//  DECAYS as the capacitor charges, while a real short's current stays
+//  roughly constant. So two independent checks run while inrush mode
+//  is active:
+//   - Periodically (every "dcc.inrush_burst_ms"), check whether
+//     nFAULT has actually cleared yet. If not, and the configurable
+//     "dcc.inrush_max_bursts" budget of periods is used up without it
+//     clearing, give up and treat it as a genuine short.
+//   - Continuously, watch the SENSE reading: if it stays at or above
+//     "dcc.inrush_short_mv" for at least "dcc.inrush_short_ms", that's
+//     read as "not decaying" — a real short — and ends the attempt
+//     immediately rather than waiting out the remaining burst budget.
+//  Either path calls _checkHBridgeFault() directly once it concludes
+//  this is a genuine short (station-wide power-off, the same response
+//  as any other escalated nFAULT).
+//
+//  All four thresholds are EEPROM-configurable (web interface, System
+//  panel) — deliberately NOT per-bridge (unlike the fault-escalation
+//  thresholds elsewhere in this file): both DCC and SM drive the same
+//  kind of decoder-equipped loco, so the same inrush characteristics
+//  should apply to either. The defaults below are Rob's own rough
+//  starting estimates, explicitly flagged (his own words) as needing
+//  empirical, on-the-bench tuning against this hardware's actual
+//  behaviour — treat them as placeholders, not calibrated values.
+// ─────────────────────────────────────────────────────────────
+void DccHal::_updateInrush(bool dccEdge, bool smEdge) {
+    if (!_power) {
+        // Track power went off (e.g. this same escalation calling
+        // _checkHBridgeFault() a moment ago) while an attempt was still
+        // running — clean up immediately rather than leaving it dangling
+        // until the next power-on, which was resuming a stale attempt
+        // with a misleading elapsed time (confirmed, Rob: TraceLog
+        // showed "RESOLVED after 55468ms" — the 55s was just how long
+        // track power happened to stay off, not anything about the
+        // actual inrush).
+        if (_inrushBridge != nullptr) {
+            dccPacketEngine.leaveInrushMode();
+            _inrushBridge = nullptr;
+        }
+        return;
+    }
+
+    HBridgeFault&            active      = _serviceModeRequested ? _faultSm  : _faultDcc;
+    const DccCurrentMonitor& activeSense = _serviceModeRequested ? _senseSm  : _senseDcc;
+    bool                     activeEdge  = _serviceModeRequested ? smEdge    : dccEdge;
+
+    uint32_t burstMs   = eepromStore().getUint32("dcc.inrush_burst_ms",   2);
+    uint16_t maxBursts = eepromStore().getUint16("dcc.inrush_max_bursts", 10);
+    uint16_t shortMv   = eepromStore().getUint16("dcc.inrush_short_mv",   2500);
+    uint32_t shortMs   = eepromStore().getUint32("dcc.inrush_short_ms",   20);
+
+    // Idle: a fresh edge on the active bridge starts a new attempt —
+    // but only if SENSE at fault-onset actually indicates real current
+    // flowing. Per the DRV8874/DRV8876 datasheet, nFAULT is a single
+    // shared flag for FOUR distinct conditions: UVLO, CPUV, OCP, and
+    // TSD — and for three of those four (everything except OCP), the
+    // outputs are simply disabled, meaning no current flows at all.
+    // A fault with a near-zero SENSE reading is therefore almost
+    // certainly one of those three, NOT an overcurrent/inrush
+    // situation — confirmed, Rob: locos that wouldn't drive were
+    // showing repeated nFAULTs with SENSE around 4-5mV, and the
+    // inrush pulse train (which only ever helps a genuine current
+    // event) was uselessly retrying against something it can never
+    // resolve. Below "dcc.inrush_min_mv", skip inrush entirely and
+    // fall straight through to the plain shouldEscalate()/
+    // checkDuration() safety net below (unchanged from before this
+    // whole feature existed) — _inrushBridge stays nullptr, so those
+    // checks are not skipped for this edge.
+    if (_inrushBridge == nullptr) {
+        if (!activeEdge) return;
+        uint16_t minMv   = eepromStore().getUint16("dcc.inrush_min_mv", 50);
+        uint16_t senseMv = activeSense.lastMv();
+        bool     lowSense = senseMv < minMv;
+        if (lowSense) {
+            // What to do about a fault that looks like UVLO/CPUV/TSD
+            // rather than overcurrent (Rob wanted this configurable —
+            // the pulses are only KNOWN to help against a current
+            // event, so trying them here is an experiment):
+            //   0 = Skip — plain escalation checks only (the original
+            //       behaviour of this gate)
+            //   1 = Only during a fault storm — inrush is tried once
+            //       dcc.inrush_lo_cnt faults land within
+            //       dcc.inrush_lo_ms (HBridgeFault's own edge history;
+            //       this edge was already recorded by check())
+            //   2 = Always — every such fault gets an inrush attempt
+            // An attempt started here also uses its OWN timing
+            // (dcc.inrush_lo_burst_ms / dcc.inrush_lo_max, see below):
+            // a chip recovering from undervoltage or thermal shutdown
+            // has no reason to behave like an overcurrent retry.
+            uint8_t loMode = eepromStore().getUint8("dcc.inrush_lo_mode", 1);
+            bool    try_   = false;
+            uint8_t  loCnt = eepromStore().getUint8 ("dcc.inrush_lo_cnt", 5);
+            uint32_t loMs  = eepromStore().getUint32("dcc.inrush_lo_ms",  100);
+            if (loMode == 2)      try_ = true;
+            else if (loMode == 1) try_ = active.stormWithin(loMs, loCnt);
+            if (!try_) {
+                traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
+                                 "%s fault sense=%umV < %umV, not inrush (UVLO/CPUV/TSD?) — skipping inrush",
+                                 active.name(), senseMv, minMv);
+                return;
+            }
+            if (loMode == 1)
+                traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
+                                 "%s fault sense=%umV < %umV but >=%u faults within %lums — trying inrush anyway",
+                                 active.name(), senseMv, minMv, loCnt, loMs);
+        }
+        _inrushBridge       = &active;
+        _inrushLowSense     = lowSense;
+        _inrushStartMs      = millis();
+        _inrushBurstStartMs = _inrushStartMs;
+        _inrushBurstCount   = 0;
+        _inrushShortSinceMs = 0;
+        active.resetDuration();  // clear any contamination from a gap sample before this attempt — see resetDuration()'s own comment
+        dccPacketEngine.enterInrushMode();
+        traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
+                         "%s inrush mode ENTER%s, sense=%umV",
+                         active.name(), lowSense ? " (low-sense)" : "", senseMv);
+        return;
+    }
+
+    // The active bridge changed mid-attempt (e.g. a service-mode
+    // session started or ended) — abandon cleanly rather than keep
+    // running an attempt against a bridge we're no longer tracking.
+    if (_inrushBridge != &active) {
+        dccPacketEngine.leaveInrushMode();
+        _inrushBridge = nullptr;
+        return;
+    }
+
+    // An attempt that was started for a suspected UVLO/CPUV/TSD fault
+    // (low sense) uses its own period/budget, not the overcurrent ones.
+    if (_inrushLowSense) {
+        burstMs   = eepromStore().getUint32("dcc.inrush_lo_burst_ms", 2);
+        maxBursts = eepromStore().getUint16("dcc.inrush_lo_max",      10);
+    }
+
+    // Sustained-short check — every loop() iteration, independent of
+    // the periodic burst check below.
+    uint16_t mv = activeSense.lastMv();
+    if (mv >= shortMv) {
+        if (_inrushShortSinceMs == 0) {
+            _inrushShortSinceMs = millis();
+        } else if (millis() - _inrushShortSinceMs >= shortMs) {
+            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE,
+                             "%s inrush -> SHORT (sense %umV >= %umV for >=%lums)",
+                             active.name(), mv, shortMv, shortMs);
+            dccPacketEngine.leaveInrushMode();
+            _inrushBridge = nullptr;
+            _checkHBridgeFault(active);
+            return;
+        }
+    } else {
+        _inrushShortSinceMs = 0;  // back below threshold — sustained timer resets
+    }
+
+    // Periodic burst check: has nFAULT actually cleared yet?
+    if (millis() - _inrushBurstStartMs < burstMs) return;  // still within this period
+    _inrushBurstStartMs = millis();
+    _inrushBurstCount++;
+
+    // Logged every period, not just on resolve/give-up — added (Rob:
+    // wanted to see the actual sense trend across periods, to judge
+    // whether "dcc.inrush_short_mv" is set too low, since a genuine
+    // inrush is expected to show a DECREASING sequence of these values
+    // while a real short would stay roughly flat).
+    traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
+                     "%s inrush period %u: sense=%umV, faulted=%d",
+                     active.name(), _inrushBurstCount, mv, active.isFaulted());
+
+    if (!active.isFaulted()) {
+        traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
+                         "%s inrush RESOLVED after %lums (%u periods), sense=%umV",
+                         active.name(), millis() - _inrushStartMs, _inrushBurstCount, mv);
+        active.resetDuration();  // clean baseline for the next independent checkDuration() call — see its own comment
+        dccPacketEngine.leaveInrushMode();
+        _inrushBridge = nullptr;
+        return;
+    }
+
+    if (_inrushBurstCount >= maxBursts) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE,
+                         "%s inrush GIVE UP after %u periods, still faulted -> SHORT",
+                         active.name(), _inrushBurstCount);
+        dccPacketEngine.leaveInrushMode();
+        _inrushBridge = nullptr;
+        _checkHBridgeFault(active);
+    }
+    // else: budget remains — stay in inrush mode, next period will check again.
+}
+
+// ─────────────────────────────────────────────────────────────
 //  _checkHBridgeFault() — v2 hardware H-bridge nFAULT response
 //
 //  Called once per bridge from loop(), only when that bridge's
@@ -487,7 +699,7 @@ void DccHal::loop() {
     // different chip variant, DRV8876 vs the DCC bridge's DRV8874 —
     // same reasoning as the per-bridge ACK-threshold fields) can be
     // tuned independently if its retry timing differs.
-    struct FaultParams { uint32_t windowMs, durationMs, clearMs; uint8_t retryCount; };
+    struct FaultParams { uint32_t windowMs, durationMs, clearMs; uint16_t debounce; uint8_t retryCount; };
     auto faultParams = [](const char* prefix) {
         char key[24];
         FaultParams p;
@@ -507,6 +719,12 @@ void DccHal::loop() {
         // sample caught between blips.
         snprintf(key, sizeof(key), "%s.fault_clear_ms", prefix);
         p.clearMs    = eepromStore().getUint32(key, 10);
+        // Edge debounce for HBridgeFault::check() — consecutive LOW
+        // loop() samples required before a low counts as a fault edge
+        // (Rob: was hardcoded to 3). Samples, not time — see check()'s
+        // own comment. Default 3 preserves the old behaviour.
+        snprintf(key, sizeof(key), "%s.fault_debounce", prefix);
+        p.debounce   = eepromStore().getUint16(key, 3);
         return p;
     };
     FaultParams dccParams = faultParams("dcc");
@@ -533,33 +751,60 @@ void DccHal::loop() {
     // track power going out — suspected too many small nFAULT events
     // even though none is individually escalating) becomes visible via
     // TraceLog, one line per H-bridge (name() distinguishes DCC/SM/CDE).
-    bool dccEdge = _faultDcc.check();
-    bool smEdge  = _faultSm.check();
-    bool cdeEdge = _faultCde.check();
+    bool dccEdge = _faultDcc.check(dccParams.debounce);
+    bool smEdge  = _faultSm.check(smParams.debounce);
+    bool cdeEdge = _faultCde.check(cdeParams.debounce);
     if (dccEdge) traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultDcc.name());
     if (smEdge)  traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultSm.name());
     if (cdeEdge) traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultCde.name());
 
-    if (dccEdge && _faultDcc.shouldEscalate(dccParams.windowMs, dccParams.retryCount)) {
-        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count within window)", _faultDcc.name());
-        _checkHBridgeFault(_faultDcc);
-    }
-    if (_faultDcc.checkDuration(dccParams.durationMs, dccParams.clearMs)) {
-        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultDcc.name());
-        _checkHBridgeFault(_faultDcc);
+    // Inrush protection (DCC/SM only — see _updateInrush()'s own
+    // comment) gets first crack at a fresh fault edge on whichever of
+    // the two is currently active.
+    _updateInrush(dccEdge, smEdge);
+
+    // While _updateInrush() owns an in-progress attempt for a bridge
+    // (or just started/ended one this very iteration), skip the
+    // generic edge-count/duration escalation checks for THAT bridge —
+    // confirmed, Rob (TraceLog): several individually-resolved inrush
+    // recoveries in quick succession (each cleared within ~2ms) were
+    // tripping shouldEscalate()'s retry-count check anyway, even
+    // though every one of them was already handled correctly and
+    // nothing was actually wrong. checkDuration() is skipped here too
+    // for the same reason — it isn't edge-gated, so it would otherwise
+    // keep timing "continuously low" through a normal, in-progress
+    // inrush attempt regardless. Once idle (no attempt running for
+    // that bridge — either it resolved, or inrush already gave up and
+    // escalated through its own _checkHBridgeFault() call above),
+    // these resume as a normal, independent backstop for a genuinely
+    // different, unrelated fault.
+    bool dccOwnedByInrush = (_inrushBridge == &_faultDcc);
+    bool smOwnedByInrush  = (_inrushBridge == &_faultSm);
+
+    if (!dccOwnedByInrush) {
+        if (dccEdge && _faultDcc.shouldEscalate(dccParams.windowMs, dccParams.retryCount)) {
+            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count: %u faults within %lums)", _faultDcc.name(), (unsigned)dccParams.retryCount, (unsigned long)dccParams.windowMs);
+            _checkHBridgeFault(_faultDcc);
+        }
+        if (_faultDcc.checkDuration(dccParams.durationMs, dccParams.clearMs)) {
+            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultDcc.name());
+            _checkHBridgeFault(_faultDcc);
+        }
     }
 
-    if (smEdge && _faultSm.shouldEscalate(smParams.windowMs, smParams.retryCount)) {
-        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count within window)", _faultSm.name());
-        _checkHBridgeFault(_faultSm);
-    }
-    if (_faultSm.checkDuration(smParams.durationMs, smParams.clearMs)) {
-        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultSm.name());
-        _checkHBridgeFault(_faultSm);
+    if (!smOwnedByInrush) {
+        if (smEdge && _faultSm.shouldEscalate(smParams.windowMs, smParams.retryCount)) {
+            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count: %u faults within %lums)", _faultSm.name(), (unsigned)smParams.retryCount, (unsigned long)smParams.windowMs);
+            _checkHBridgeFault(_faultSm);
+        }
+        if (_faultSm.checkDuration(smParams.durationMs, smParams.clearMs)) {
+            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultSm.name());
+            _checkHBridgeFault(_faultSm);
+        }
     }
 
     if (cdeEdge && _faultCde.shouldEscalate(cdeParams.windowMs, cdeParams.retryCount)) {
-        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count within window)", _faultCde.name());
+        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count: %u faults within %lums)", _faultCde.name(), (unsigned)cdeParams.retryCount, (unsigned long)cdeParams.windowMs);
         _checkHBridgeFault(_faultCde);
     }
     if (_faultCde.checkDuration(cdeParams.durationMs, cdeParams.clearMs)) {

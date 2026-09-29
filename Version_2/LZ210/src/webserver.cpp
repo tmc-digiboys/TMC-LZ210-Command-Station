@@ -242,6 +242,29 @@ void Webserver::_handleClient(EthernetClient& client) {
 //  have been successfully parsed, regardless of whether a body was
 //  present.
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+//  _readLine() — see webserver.h for why this exists (client.available()
+//  going momentarily false mid-request must not be read as "no more
+//  data coming"). Waits for more bytes whenever available() is false,
+//  up to deadlineMs; gives up and returns -1 only once that absolute
+//  deadline has passed with no complete line received.
+// ─────────────────────────────────────────────────────────────
+int16_t Webserver::_readLine(EthernetClient& client, char* buf, uint8_t maxLen, uint32_t deadlineMs) {
+    uint8_t i = 0;
+    while (true) {
+        if (!client.available()) {
+            if (millis() >= deadlineMs) return -1;
+            delay(1);
+            continue;
+        }
+        char c = client.read();
+        if (c == '\n') break;
+        if (c != '\r' && i < (uint8_t)(maxLen - 1)) buf[i++] = c;
+    }
+    buf[i] = 0;
+    return (int16_t)i;
+}
+
 bool Webserver::_parseRequest(EthernetClient& client, HttpRequest& req) {
     memset(&req, 0, sizeof(req));
     req.valid = false;
@@ -251,14 +274,11 @@ bool Webserver::_parseRequest(EthernetClient& client, HttpRequest& req) {
     while (!client.available() && millis() - t0 < 1000) delay(1);
     if (!client.available()) return false;
 
+    uint32_t deadline = millis() + 1000;  // shared across the whole request-line + headers phase
+
     // Read the first line: METHOD PATH HTTP/1.x
-    char line[128]; uint8_t li = 0;
-    while (client.available() && li < 127) {
-        char c = client.read();
-        if (c == '\n') break;
-        if (c != '\r') line[li++] = c;
-    }
-    line[li] = 0;
+    char line[128];
+    if (_readLine(client, line, sizeof(line), deadline) < 0) return false;
 
     // Parse method and path
     char* sp1 = strchr(line, ' ');
@@ -273,15 +293,9 @@ bool Webserver::_parseRequest(EthernetClient& client, HttpRequest& req) {
 
     // Skip headers, looking for Content-Length
     uint16_t contentLength = 0;
-    while (client.available()) {
-        li = 0;
-        while (client.available() && li < 127) {
-            char c = client.read();
-            if (c == '\n') break;
-            if (c != '\r') line[li++] = c;
-        }
-        line[li] = 0;
-        if (li == 0) break;  // empty line = end of headers
+    while (true) {
+        int16_t li = _readLine(client, line, sizeof(line), deadline);
+        if (li <= 0) break;  // -1 (deadline) or 0 (blank line = end of headers)
         if (strncmp(line, "Content-Length:", 15) == 0)
             contentLength = (uint16_t)atoi(line + 16);
     }
@@ -640,12 +654,61 @@ void Webserver::_panelSysteem(EthernetClient& c) {
         snprintf(key, sizeof(key), "%s.fault_window_ms", b.prefix);
         _printField(c, key, "Window (ms)");
         snprintf(key, sizeof(key), "%s.fault_retry_count", b.prefix);
-        _printField(c, key, "Faults within window to escalate");
+        _printField(c, key, "Faults within window to escalate (1-5; above 5 never fires)");
         snprintf(key, sizeof(key), "%s.fault_duration_ms", b.prefix);
         _printField(c, key, "Continuous-low duration to escalate (ms)");
         snprintf(key, sizeof(key), "%s.fault_clear_ms", b.prefix);
         _printField(c, key, "Recovery-confirm debounce (ms)");
+        snprintf(key, sizeof(key), "%s.fault_debounce", b.prefix);
+        _printField(c, key, "Edge debounce (consecutive low samples)");
     }
+    // ── Inrush protection: three blocks, one per question ─────────────
+    // (1) how a fault is classified, (2) what happens for HIGH sense,
+    // (3) what happens for LOW sense. Kept as separate fieldsets on
+    // purpose — these used to be one long mixed list, which made it
+    // unclear which setting applied to which situation (Rob).
+    c.print(F("</fieldset>"
+              "<fieldset><legend>Inrush protection: which faults are which (DCC/SM)</legend>"
+              "<p class='hint'>nFAULT on the DRV8874/DRV8876 is one shared flag for "
+              "four different causes: UVLO, CPUV, OCP and TSD. Only OCP (overcurrent) "
+              "involves real current; the other three just switch the outputs off, so "
+              "SENSE reads near zero. The SENSE level at the moment of the fault "
+              "therefore splits faults into two situations, set up separately below. "
+              "Applies to the DCC and SM bridges only, not CDE.</p>"));
+    _printField(c, "dcc.inrush_min_mv", "SENSE level dividing HIGH from LOW (mV)");
+    c.print(F("<p class='hint'>At or above this level: situation 1. "
+              "Below it: situation 2.</p></fieldset>"
+
+              "<fieldset><legend>Situation 1: nFAULT with HIGH sense (overcurrent) "
+              "- always inrush</legend>"
+              "<p class='hint'>Every such fault gets an inrush attempt: short pulses, "
+              "too brief to trip the overcurrent comparator, replace the normal DCC "
+              "packets so a decoder's input capacitor can charge gradually. Genuine "
+              "inrush current decays; a real short stays roughly constant. The attempt "
+              "ends when the fault clears. It is treated as a real short (power off) "
+              "when the periods run out, or when SENSE stays too high for too long. "
+              "Rough starting values - tune on the bench.</p>"));
+    _printField(c, "dcc.inrush_burst_ms",   "Check period (ms)");
+    _printField(c, "dcc.inrush_max_bursts", "Max periods before giving up");
+    _printField(c, "dcc.inrush_short_mv",   "SENSE level that means a real short (mV)");
+    _printField(c, "dcc.inrush_short_ms",   "SENSE must stay that high for (ms)");
+
+    c.print(F("</fieldset>"
+              "<fieldset><legend>Situation 2: nFAULT with LOW sense "
+              "(suspected UVLO/CPUV/TSD) - inrush optional</legend>"
+              "<p class='hint'>No overcurrent is flowing here, so the pulses are not "
+              "known to help. Choose whether to try inrush anyway (experimental). "
+              "If not, these faults go straight to the plain fault handling.</p>"));
+    _printField(c, "dcc.inrush_lo_mode", "Use inrush for these faults?");
+    c.print(F("<p class='hint'>A fault storm is this many faults within this "
+              "time. Only used when the choice above is "
+              "&quot;Only during a fault storm&quot;.</p>"));
+    _printField(c, "dcc.inrush_lo_cnt", "Fault storm: number of faults (max 32)");
+    _printField(c, "dcc.inrush_lo_ms",  "Fault storm: within (ms)");
+    c.print(F("<p class='hint'>Timing for inrush attempts started for this "
+              "situation (separate from situation 1).</p>"));
+    _printField(c, "dcc.inrush_lo_burst_ms", "Check period (ms)");
+    _printField(c, "dcc.inrush_lo_max",      "Max periods before giving up");
     c.print(F("</fieldset>"
               "<button class='btn'>Save</button></form>"));
 
@@ -1047,6 +1110,15 @@ void Webserver::_panelDccHal(EthernetClient& c) {
               "<button class='btn' type='submit' "
               "onclick=\"return confirm('Reset all nFAULT counters?')\">"
               "Reset nFAULT counters</button></form>"));
+    c.print(F("<p class='hint'>Inrush protection (DCC/SM only — see the "
+              "System panel's own settings): "));
+    if (gDccHal.inrushActive()) {
+        c.print(F("currently ACTIVE for "));
+        c.print(gDccHal.inrushBridgeName());
+    } else {
+        c.print(F("idle"));
+    }
+    c.print(F(".</p>"));
     _shellClose(c);
 }
 

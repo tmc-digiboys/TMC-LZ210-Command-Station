@@ -72,15 +72,22 @@ public:
     // Call every loop() iteration. Returns true exactly once per
     // fault event (edge-triggered on the transition into the fault
     // state), not continuously for as long as the pin stays low.
-    // Debounced with a small number of consecutive low readings to
-    // reject a single-sample glitch, though the chip's own nFAULT
-    // flag is expected to already be clean. Every true return is also
-    // recorded into the recent-fault history used by shouldEscalate()
-    // below.
+    // Debounced: the pin must read LOW on debounceSamples consecutive
+    // calls before it counts as an edge, to reject a short glitch,
+    // though the chip's own nFAULT flag is expected to already be
+    // clean. debounceSamples is passed in by the caller (DccHal reads
+    // it per bridge from EEPROM, "<prefix>.fault_debounce") — this
+    // class deliberately does no EEPROM lookups itself. NOTE: it
+    // counts loop() iterations, NOT time — the real-world duration a
+    // given count represents depends on how fast loop() runs. The
+    // default of 3 is the value that used to be hardcoded here. 0 and
+    // 1 both mean "no debounce" (first low sample counts). Every true
+    // return is also recorded into the recent-fault history used by
+    // shouldEscalate() below.
     //
     // Also maintains faultCountRaw() (below) — a SEPARATE count,
     // incremented on every raw low-going transition, BEFORE the
-    // 3-sample debounce filter runs, so a single-sample glitch that
+    // debounce filter runs, so a short glitch that
     // never reaches faultCount() (the debounced count) still shows up
     // there. Requested explicitly (Rob): the raw count is the more
     // meaningful of the two for judging how electrically noisy a
@@ -88,7 +95,7 @@ public:
     // hide that, since several raw glitches close together collapse
     // into at most one debounced edge (check() ignores the pin
     // entirely while _wasLow is already true).
-    bool check() {
+    bool check(uint16_t debounceSamples = 3) {
         bool faultNow = (digitalRead(_pin) == LOW);
 
         if (faultNow && !_wasRawLow) _faultCountRaw++;
@@ -96,7 +103,8 @@ public:
 
         if (!faultNow) { _wasLow = false; _lowCount = 0; return false; }
         if (_wasLow) return false;          // already reported, still ongoing
-        if (++_lowCount < 3) return false;  // debounce: 3 consecutive lows
+        if (_lowCount < 0xFFFF) _lowCount++;  // saturate rather than wrap
+        if (_lowCount < debounceSamples) return false;  // debounce: N consecutive lows
         _wasLow = true;
         _recordFault();
         return true;
@@ -123,13 +131,36 @@ public:
     // after this method was introduced, even with retryCount=3, its
     // original default). checkDuration() below is a second,
     // independent signal — call BOTH and escalate on either.
+    //
+    // ONLY THE NEWEST HBRIDGE_ESCALATE_HISTORY (5) EDGES ARE LOOKED AT,
+    // exactly as when the whole history was 5 entries long. That means
+    // a retryCount above 5 can never fire — a quirk of the original
+    // code, and existing settings (Rob: retry count 20, stays on) rely
+    // on it. Widening this to the full history changed that behaviour
+    // behind his back (a storm of 20 edges in 400ms then powered off),
+    // so it is deliberately kept as it was. The web page labels the
+    // limit. Use stormWithin() below for counts above 5.
     bool shouldEscalate(uint32_t windowMs, uint8_t retryCount) const {
         uint32_t now = millis();
         uint8_t count = 0;
-        for (uint8_t i = 0; i < HBRIDGE_FAULT_HISTORY; i++) {
-            if (_history[i] != 0 && (now - _history[i]) <= windowMs) count++;
+        for (uint8_t k = 0; k < HBRIDGE_ESCALATE_HISTORY; k++) {
+            uint8_t idx = (uint8_t)((_historyHead + HBRIDGE_FAULT_HISTORY - 1 - k) % HBRIDGE_FAULT_HISTORY);
+            if (_history[idx] != 0 && (now - _history[idx]) <= windowMs) count++;
         }
         return count >= retryCount;
+    }
+
+    // "Fault storm" test for DccHal::_updateInrush()'s low-sense rule:
+    // true if at least `count` recorded edges fall within the last
+    // windowMs. Uses the FULL history (up to HBRIDGE_FAULT_HISTORY
+    // entries), so counts up to 32 work — unlike shouldEscalate().
+    bool stormWithin(uint32_t windowMs, uint8_t count) const {
+        uint32_t now = millis();
+        uint8_t n = 0;
+        for (uint8_t i = 0; i < HBRIDGE_FAULT_HISTORY; i++) {
+            if (_history[i] != 0 && (now - _history[i]) <= windowMs) n++;
+        }
+        return n >= count;
     }
 
     // Call every loop() iteration (independently of check() — this
@@ -183,6 +214,26 @@ public:
     // for status display, e.g. the web interface).
     bool isFaulted() const { return digitalRead(_pin) == LOW; }
 
+    // Clears checkDuration()'s own timestamp state. Needed by
+    // DccHal::_updateInrush(): while inrush handling owns this bridge,
+    // checkDuration() is skipped for it (see _updateInrush()'s own
+    // comment) — but checkDuration() still runs normally in the brief
+    // gaps BETWEEN successive inrush attempts (e.g. a loosely-seated
+    // loco bouncing on the rails, faulting several times in quick
+    // succession, each individually resolved). If one of those gap
+    // samples happens to catch the pin still low, it silently starts
+    // (or keeps alive) a duration window that then keeps accumulating
+    // across the WHOLE series once inrush hands control back —
+    // confirmed, Rob (TraceLog): five separate ~2-6ms inrush-resolved
+    // faults within about 50ms, each with a low, safe SENSE reading,
+    // still tripped checkDuration()'s escalation right after the last
+    // one resolved. Called by _updateInrush() both when a fresh
+    // attempt starts (clears any such contamination from before) and
+    // when one resolves (so the next independent checkDuration() call
+    // starts from a clean baseline, not one contaminated by this
+    // attempt's own brief low periods).
+    void resetDuration() { _durationSinceMs = 0; _recoverSinceMs = 0; }
+
     // Short display name for this bridge ("DCC"/"SM"/"CDE").
     const char* name() const { return _name; }
 
@@ -197,7 +248,7 @@ public:
     // via a button, not meant to survive a power cycle).
     //
     // faultCountRaw(): every individual low-going transition on the
-    // pin, before the 3-sample debounce filter.
+    // pin, before the debounce filter.
     // faultCount(): only the edges that passed that filter (the same
     // signal shouldEscalate() is built from) — NOT gated on whether
     // that particular edge went on to escalate, so an isolated,
@@ -211,7 +262,7 @@ private:
     uint8_t     _pin;
     const char* _name;
     bool        _wasLow     = false;
-    uint8_t     _lowCount   = 0;
+    uint16_t    _lowCount   = 0;
     bool        _wasRawLow  = false;
     uint32_t    _faultCount    = 0;
     uint32_t    _faultCountRaw = 0;
@@ -221,7 +272,15 @@ private:
     // short window. Entries older than any realistic window are
     // simply ignored by shouldEscalate()'s own age check, so this
     // never needs explicit pruning.
-    static constexpr uint8_t HBRIDGE_FAULT_HISTORY = 5;
+    // 32 entries, used by stormWithin() (the low-sense fault-storm rule
+    // in DccHal::_updateInrush()). shouldEscalate() only looks at the
+    // newest 5 of them on purpose — see its comment. Costs 32*4 bytes
+    // per bridge; entries older than any realistic window are ignored
+    // by the age check anyway.
+    static constexpr uint8_t HBRIDGE_FAULT_HISTORY = 32;
+    // How many of the newest entries shouldEscalate() considers — the
+    // original history size, kept so its behaviour did not change.
+    static constexpr uint8_t HBRIDGE_ESCALATE_HISTORY = 5;
     uint32_t _history[HBRIDGE_FAULT_HISTORY] = {0};
     uint8_t  _historyHead = 0;
 
