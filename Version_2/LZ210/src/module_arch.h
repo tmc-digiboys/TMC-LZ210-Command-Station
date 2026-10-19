@@ -94,6 +94,11 @@ enum class CmdType : uint8_t {
     POWER_ON          = 0x20,
     POWER_OFF         = 0x21,
     EMERGENCY_STOP    = 0x22,
+    // Emergency-stop every loco whose most recent speed/function command
+    // came from module `address` (a ModuleId). Used when a LenzLAN client
+    // (Rocrail) is lost unexpectedly: its locos stop, locos driven from
+    // a handheld (RS-485, LocoNet) carry on. See DccHal::_stopLocosOf().
+    STOP_LOCOS_OF     = 0x23,
     CV_READ           = 0x30,
     CV_WRITE          = 0x31,
     POM_WRITE         = 0x32,

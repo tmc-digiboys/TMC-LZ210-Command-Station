@@ -10,6 +10,8 @@
 #include "trace_log.h"             // traceLog()
 #include "loco_repository.h"      // locoRepo()
 #include "eeprom_store.h"         // eepromStore()
+#include <SPI.h>
+#include <utility/w5100.h>          // W5100.readSnSR/readSnPORT/readSnMR (socket diagnostics)
 #include <stdio.h>
 #include <string.h>
 
@@ -20,6 +22,7 @@ Webserver gWebserver;
 // WEB_PORT) and resets the active-client counter to 0.
 void Webserver::begin() {
     uint16_t port = eepromStore().getUint16("web.port", WEB_PORT);
+    _port = port;
     _server = new EthernetServer(port);
     _server->begin();
     _activeClients = 0;
@@ -32,6 +35,7 @@ void Webserver::begin() {
 // loop() being called frequently enough by the module registry), then
 // closes the connection and decrements the counter again.
 void Webserver::loop() {
+    _logSockets();
     EthernetClient client = _server->accept();
     if (client) {
         _activeClients++;
@@ -48,6 +52,98 @@ void Webserver::loop() {
         client.flush();
         client.stop();
         _activeClients--;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  _logSockets() — W5500 socket diagnostics (see webserver.h)
+//
+//  One entry per hardware socket, "<n>:<state><port>":
+//    -  CLOSED (free)            L  LISTEN
+//    E  ESTABLISHED              W  CLOSE_WAIT
+//    U  UDP (port = local port)  T  TIME_WAIT / FIN_WAIT / CLOSING / LAST_ACK
+//    I  INIT                     S  SYN_SENT / SYN_RECV
+//    ?xx anything else (raw Sn_SR in hex)
+//  e.g.  SOCK 7/8 used: 0:U21105 1:U5353 2:L5550 3:E5550 4:L1234 5:L23456 6:E23456 7:L80
+//  Known ports: 80 web, 5550 LenzLAN, 1234 LocoNet-over-TCP,
+//  23456 trace log, 21105 Z21, 5353 mDNS.
+//
+//  Reads the chip directly (like LenzLan::_freeConnections()), inside
+//  an SPI transaction so it cannot inherit another SPI device's
+//  settings. Everything runs on core1, the only core that touches the
+//  W5500, so there is no concurrent access.
+// ─────────────────────────────────────────────────────────────
+void Webserver::_logSockets() {
+    uint32_t now = millis();
+    if (now - _sockSampleMs < 1000) return;
+    _sockSampleMs = now;
+
+    char line[sizeof(_sockLast)];
+    int  n = 0;
+    uint8_t used = 0;
+    bool webListening = false;
+
+    for (uint8_t s = 0; s < MAX_SOCK_NUM; s++) {
+#ifdef SPI_ETHERNET_SETTINGS
+        SPI.beginTransaction(SPI_ETHERNET_SETTINGS);
+#endif
+        uint8_t  sr   = W5100.readSnSR(s);
+        uint16_t port = W5100.readSnPORT(s);
+#ifdef SPI_ETHERNET_SETTINGS
+        SPI.endTransaction();
+#endif
+        char code[4] = "?";
+        switch (sr) {
+            case 0x00: code[0] = '-'; break;                    // CLOSED
+            case 0x13: code[0] = 'I'; break;                    // INIT
+            case 0x14: code[0] = 'L'; break;                    // LISTEN
+            case 0x15: case 0x16: code[0] = 'S'; break;         // SYN_SENT / SYN_RECV
+            case 0x17: code[0] = 'E'; break;                    // ESTABLISHED
+            case 0x1C: code[0] = 'W'; break;                    // CLOSE_WAIT
+            case 0x18: case 0x1A: case 0x1B: case 0x1D:
+                       code[0] = 'T'; break;                    // FIN_WAIT / CLOSING / TIME_WAIT / LAST_ACK
+            case 0x22: code[0] = 'U'; break;                    // UDP
+            default:   snprintf(code, sizeof(code), "?%02X", sr); break;
+        }
+        if (sr != 0x00) used++;
+        if (sr == 0x14 && port == _port) webListening = true;
+
+        int w;
+        if (sr == 0x00) w = snprintf(line + n, sizeof(line) - (size_t)n, " %u:-", s);
+        else            w = snprintf(line + n, sizeof(line) - (size_t)n, " %u:%s%u", s, code, port);
+        if (w < 0) break;
+        n += w;
+        if ((size_t)n >= sizeof(line)) { n = sizeof(line) - 1; break; }
+    }
+    line[n] = '\0';
+
+    // Log on change, and every 30s regardless (so a quiet log still
+    // shows the current picture when the web interface goes away).
+    bool changed = strcmp(line, _sockLast) != 0;
+    if (changed || now - _sockLogMs >= 30000) {
+        traceLog().logf(TraceLevel::INFO, TraceSource::WEB,
+                        "SOCK %u/%u used:%s", used, (unsigned)MAX_SOCK_NUM, line);
+        strncpy(_sockLast, line, sizeof(_sockLast) - 1);
+        _sockLast[sizeof(_sockLast) - 1] = '\0';
+        _sockLogMs = now;
+    }
+
+    // Losing / regaining the web listening socket: one line each way.
+    // While a page is being served the listening socket briefly
+    // becomes the client connection, so a single sample without one
+    // is normal; only report it when it lasts 3 consecutive samples.
+    static uint8_t missing = 0;
+    if (webListening) {
+        if (_webListenLost)
+            traceLog().logf(TraceLevel::WARNING, TraceSource::WEB,
+                            "web port %u listening again", _port);
+        _webListenLost = false;
+        missing = 0;
+    } else if (!_webListenLost && ++missing >= 3) {
+        _webListenLost = true;
+        traceLog().logf(TraceLevel::WARNING, TraceSource::WEB,
+                        "NO socket listening on web port %u (%u/%u sockets used)",
+                        _port, used, (unsigned)MAX_SOCK_NUM);
     }
 }
 
@@ -189,10 +285,9 @@ void Webserver::_handleClient(EthernetClient& client) {
             return;
         }
         if (_pathEquals(req.path, "/clear/hfaults")) {
-            // Resets all three bridges' nFAULT counters (raw and
-            // debounced) — see HBridgeFault::resetFaultCounts()'s own
-            // comment: purely in-RAM, so this is the only way to zero
-            // them short of a reboot.
+            // Resets all three bridges' nFAULT counters and the guards'
+            // statistics — purely in-RAM, so this is the only way to
+            // zero them short of a reboot.
             gDccHal.resetHBridgeFaultCounts();
             _sendRedirect(client, "/?p=dcchal");
             return;
@@ -620,13 +715,25 @@ void Webserver::_panelSysteem(EthernetClient& c) {
     c.print(F("<fieldset><legend>Startup</legend>"));
     _printField(c, "dcc.startup_power", "Power state at startup");
     c.print(F("</fieldset>"));
+    c.print(F("<fieldset><legend>Safety</legend>"
+              "<p class='hint'>All network traffic (Rocrail/LenzLAN, Z21, "
+              "web, trace log) runs on core1. If core1 hangs, DCC keeps "
+              "running with the last speeds and no loco can be stopped. "
+              "When core1 shows no sign of life for longer than this, track "
+              "power is switched off (and stays off). 0 = off. The trace log "
+              "names the module core1 was in.</p>"));
+    _printField(c, "sys.core1_stall_ms", "Cut track power when core1 stalls longer than (ms)");
+    c.print(F("</fieldset>"));
     c.print(F("<fieldset><legend>CDE Booster short-circuit response</legend>"
               "<p class='hint'>Sets how the LZ210 responds when a CDE booster"
               " detects a short circuit (E-signal held continuously low longer"
               " than the threshold below). If no CDE booster is connected at "
               "all, turn detection off entirely below — otherwise the "
               "floating/undefined E-signal will read as a permanent, "
-              "never-clearing short circuit.</p>"));
+              "never-clearing short circuit, and the CDE bridge's own nFAULT "
+              "pin (a separate, unrelated signal) will similarly read as "
+              "continuous spurious faults — the same setting now silences "
+              "both.</p>"));
     _printField(c, "sys.cde_enable", "CDE booster connected (detection enabled)");
     _printField(c, "sys.cde_mode", "Response to short circuit");
     _printField(c, "sys.cde_short_mv", "Short-circuit voltage threshold (mV)");
@@ -634,81 +741,50 @@ void Webserver::_panelSysteem(EthernetClient& c) {
     _printField(c, "sys.cde_clear_us", "Recovery-confirm debounce (&micro;s)");
     _printField(c, "sys.cde_grace_ms", "Startup grace period (ms)");
     c.print(F("</fieldset>"
-              "<fieldset><legend>H-bridge nFAULT escalation (v2 hardware)</legend>"
-              "<p class='hint'>An isolated nFAULT blip on any of the three "
-              "H-bridges (DCC/SM/CDE) is expected and harmless — the "
-              "DRV887x chips already recover from it automatically. Track "
-              "power is only cut when EITHER faults recur repeatedly within "
-              "the window below, OR nFAULT is observed continuously low for "
-              "at least the duration below (needed since a genuinely "
-              "persistent fault doesn't always trigger the first check under "
-              "automatic-retry). Configured per bridge, since the CDE "
-              "bridge is a different chip variant (DRV8876 vs the DCC "
-              "bridge's DRV8874) and may need different tuning.</p>"));
-    const struct { const char* prefix; const char* label; } faultBridges[] = {
-        { "dcc", "DCC" }, { "sm", "SM/programming track" }, { "cde", "CDE" },
-    };
-    for (auto& b : faultBridges) {
-        char key[24];
-        c.print(F("<h4>")); c.print(b.label); c.print(F("</h4>"));
-        snprintf(key, sizeof(key), "%s.fault_window_ms", b.prefix);
-        _printField(c, key, "Window (ms)");
-        snprintf(key, sizeof(key), "%s.fault_retry_count", b.prefix);
-        _printField(c, key, "Faults within window to escalate (1-5; above 5 never fires)");
-        snprintf(key, sizeof(key), "%s.fault_duration_ms", b.prefix);
-        _printField(c, key, "Continuous-low duration to escalate (ms)");
-        snprintf(key, sizeof(key), "%s.fault_clear_ms", b.prefix);
-        _printField(c, key, "Recovery-confirm debounce (ms)");
-        snprintf(key, sizeof(key), "%s.fault_debounce", b.prefix);
-        _printField(c, key, "Edge debounce (consecutive low samples)");
-    }
-    // ── Inrush protection: three blocks, one per question ─────────────
-    // (1) how a fault is classified, (2) what happens for HIGH sense,
-    // (3) what happens for LOW sense. Kept as separate fieldsets on
-    // purpose — these used to be one long mixed list, which made it
-    // unclear which setting applied to which situation (Rob).
+              "<fieldset><legend>nFAULT guard (H-bridges)</legend>"
+              "<p class='hint'>Every H-bridge runs the state machine from the "
+              "hardware designer's nFAULT description; every step is in the "
+              "trace log. After the first nFAULT, further edges are ignored "
+              "for the ignore time. No new nFAULT within the watch time means "
+              "a micro short and nothing happens. A new nFAULT sends the "
+              "inrush pattern for the inrush time, then normal DCC resumes "
+              "and any nFAULT within the verify time cuts track power. "
+              "Defaults are the designer's values. In this version the SENSE "
+              "curve during inrush is only measured and logged (curve window "
+              "below); it does not yet influence the outcome.</p>"));
+    _printField(c, "nf.ignore_us",   "Ignore time after the first nFAULT (&micro;s)");
+    _printField(c, "nf.watch_ms",    "Watch time (ms)");
+    _printField(c, "nf.inrush_ms",   "Inrush time, from start to end of the pattern (ms)");
+    _printField(c, "nf.verify_ms",   "Verify time (ms)");
+    _printField(c, "nf.verify_edges", "nFAULT edges in verify that cut power (1 = designer's rule, 2 = tolerate one stray edge)");
+    _printField(c, "nf.skip_other",   "Skip inrush for an isolated pair of edges while running (0 = designer's rule, 1 = skip)");
+    _printField(c, "nf.inrush_itrip", "Inrush for ITRIP bursts while running (1 = designer's rule, 0 = no inrush; power-on and OCP keep it)");
+    _printField(c, "nf.itrip_max_ms", "...with 0: a chain of ITRIP bursts longer than this still starts an inrush (ms)");
+    _printField(c, "nf.pon_grace_ms", "...but not within this time after power-on (ms)");
+    _printField(c, "nf.burst_n",      "...and not for a cluster: this many pairs (max 8)");
+    _printField(c, "nf.burst_ms",     "...within this time (ms)");
+    _printField(c, "nf.meas_us",     "Inrush curve: window (&micro;s)");
+    _printField(c, "nf.restart_ms",  "After a short: wait before restarting (ms)");
+    _printField(c, "nf.restart_max", "Automatic restarts before staying off (0 = never)");
     c.print(F("</fieldset>"
-              "<fieldset><legend>Inrush protection: which faults are which (DCC/SM)</legend>"
-              "<p class='hint'>nFAULT on the DRV8874/DRV8876 is one shared flag for "
-              "four different causes: UVLO, CPUV, OCP and TSD. Only OCP (overcurrent) "
-              "involves real current; the other three just switch the outputs off, so "
-              "SENSE reads near zero. The SENSE level at the moment of the fault "
-              "therefore splits faults into two situations, set up separately below. "
-              "Applies to the DCC and SM bridges only, not CDE.</p>"));
-    _printField(c, "dcc.inrush_min_mv", "SENSE level dividing HIGH from LOW (mV)");
-    c.print(F("<p class='hint'>At or above this level: situation 1. "
-              "Below it: situation 2.</p></fieldset>"
-
-              "<fieldset><legend>Situation 1: nFAULT with HIGH sense (overcurrent) "
-              "- always inrush</legend>"
-              "<p class='hint'>Every such fault gets an inrush attempt: short pulses, "
-              "too brief to trip the overcurrent comparator, replace the normal DCC "
-              "packets so a decoder's input capacitor can charge gradually. Genuine "
-              "inrush current decays; a real short stays roughly constant. The attempt "
-              "ends when the fault clears. It is treated as a real short (power off) "
-              "when the periods run out, or when SENSE stays too high for too long. "
-              "Rough starting values - tune on the bench.</p>"));
-    _printField(c, "dcc.inrush_burst_ms",   "Check period (ms)");
-    _printField(c, "dcc.inrush_max_bursts", "Max periods before giving up");
-    _printField(c, "dcc.inrush_short_mv",   "SENSE level that means a real short (mV)");
-    _printField(c, "dcc.inrush_short_ms",   "SENSE must stay that high for (ms)");
-
-    c.print(F("</fieldset>"
-              "<fieldset><legend>Situation 2: nFAULT with LOW sense "
-              "(suspected UVLO/CPUV/TSD) - inrush optional</legend>"
-              "<p class='hint'>No overcurrent is flowing here, so the pulses are not "
-              "known to help. Choose whether to try inrush anyway (experimental). "
-              "If not, these faults go straight to the plain fault handling.</p>"));
-    _printField(c, "dcc.inrush_lo_mode", "Use inrush for these faults?");
-    c.print(F("<p class='hint'>A fault storm is this many faults within this "
-              "time. Only used when the choice above is "
-              "&quot;Only during a fault storm&quot;.</p>"));
-    _printField(c, "dcc.inrush_lo_cnt", "Fault storm: number of faults (max 32)");
-    _printField(c, "dcc.inrush_lo_ms",  "Fault storm: within (ms)");
-    c.print(F("<p class='hint'>Timing for inrush attempts started for this "
-              "situation (separate from situation 1).</p>"));
-    _printField(c, "dcc.inrush_lo_burst_ms", "Check period (ms)");
-    _printField(c, "dcc.inrush_lo_max",      "Max periods before giving up");
+              "<fieldset><legend>Power estimate (DCC/SM)</legend>"
+              "<p class='hint'>Estimates the dissipation in the driver chip as "
+              "I&sup2; &times; RDS(on), averaged over time, from the highest "
+              "SENSE value of each millisecond, and only while the bridge is "
+              "in NORMAL. Track power is cut when the estimate stays above the "
+              "limit. SENSE mV per ampere = AIPROPI &times; R_IPROPI (DRV8874 "
+              "450 &micro;A/A, DRV8876 1000 &micro;A/A); the defaults are "
+              "calculated from the datasheet for 2.49 k&Omega; in parallel "
+              "with 3.3 k&Omega; &mdash; check them against what is actually "
+              "fitted.</p>"));
+    _printField(c, "dcc.sense_mv_a", "DCC: SENSE mV per ampere");
+    _printField(c, "dcc.rds_mohm",   "DCC: RDS(on) (m&Omega;)");
+    _printField(c, "dcc.pwr_mw",     "DCC: power limit (mW)");
+    _printField(c, "dcc.pwr_shift",  "DCC: time constant (2^n ms)");
+    _printField(c, "sm.sense_mv_a",  "SM: SENSE mV per ampere");
+    _printField(c, "sm.rds_mohm",    "SM: RDS(on) (m&Omega;)");
+    _printField(c, "sm.pwr_mw",      "SM: power limit (mW)");
+    _printField(c, "sm.pwr_shift",   "SM: time constant (2^n ms)");
     c.print(F("</fieldset>"
               "<button class='btn'>Save</button></form>"));
 
@@ -822,6 +898,7 @@ void Webserver::_panelLenzLan(EthernetClient& c) {
               "<form method='POST' action='/config'>"
               "<input type='hidden' name='_p' value='lenzlan'>"));
     c.print(F("<fieldset><legend>TCP Server</legend>"));
+    _printField(c, "lenz.enable",  "XpressNet-over-LAN enabled (takes effect after a restart)");
     _printField(c, "lenz.port",    "TCP port");
     _printField(c, "lenz.maxconn", "Max connections");
     c.print(F("</fieldset><fieldset><legend>Client Tracking</legend>"
@@ -832,6 +909,15 @@ void Webserver::_panelLenzLan(EthernetClient& c) {
               "moving) — its own lifecheck interval may be longer than "
               "the current setting.</p>"));
     _printField(c, "xn.lan_timeout_s", "Client inactivity timeout (seconds)");
+    c.print(F("<p class='hint'>When a client (e.g. Rocrail) disappears without "
+              "closing its connection — lifecheck missed, PC asleep or gone, "
+              "client no longer reading — the station can stop the trains it "
+              "was driving. A client that closes its connection itself does "
+              "not trigger this. 'Locos driven via LenzLAN' stops only locos "
+              "whose last command came over LenzLAN; locos driven from an "
+              "RS-485 or LocoNet handheld carry on. Only while track power "
+              "is on.</p>"));
+    _printField(c, "xn.lan_lost_action", "When a client is lost unexpectedly");
     c.print(F("</fieldset><fieldset><legend>XpressNet Identification</legend>"));
     _printField(c, "xn.version", "Version number");
     _printField(c, "xn.kennung", "Kennung");
@@ -859,7 +945,19 @@ void Webserver::_panelLenzLan(EthernetClient& c) {
         c.print(F("</td></tr>"));
     }
     if (!any) c.print(F("<tr><td colspan='4'>None</td></tr>"));
-    c.print(F("</table></fieldset>"));
+    c.print(F("</table><p class='hint'>A client is dropped when nothing has "
+              "been received from it for "));
+    c.print(eepromStore().getUint16("xn.lan_timeout_s", 60));
+    c.print(F(" s (lifecheck). Clients lost unexpectedly since start: "));
+    c.print(gLenzLan.lostCount());
+    if (gLenzLan.lostCount()) {
+        c.print(F(" (last "));
+        c.print((now - gLenzLan.lastLostMs()) / 1000);
+        c.print(F(" s ago: "));
+        _printEscaped(c, gLenzLan.lastLostWhy());
+        c.print(F(")"));
+    }
+    c.print(F(". Details on the Debug Log page, under Recent events.</p></fieldset>"));
     _shellClose(c);
 }
 
@@ -929,6 +1027,7 @@ void Webserver::_panelZ21(EthernetClient& c) {
               "<form method='POST' action='/config'>"
               "<input type='hidden' name='_p' value='z21'>"));
     c.print(F("<fieldset><legend>UDP Server</legend>"));
+    _printField(c, "z21.enable", "Z21 enabled (takes effect after a restart)");
     _printField(c, "z21.port", "UDP port");
     c.print(F("</fieldset><fieldset><legend>Client Tracking</legend>"
               "<p class='hint'>Per the official Z21 LAN Protocol "
@@ -1011,8 +1110,16 @@ void Webserver::_panelTraceLog(EthernetClient& c) {
               "connecting again replaces the previous one.</p>"
               "<form method='POST' action='/config'>"
               "<input type='hidden' name='_p' value='tracelog'>"));
-    c.print(F("<fieldset><legend>TCP Stream</legend>"));
+    c.print(F("<fieldset><legend>Trace output</legend>"
+              "<p class='hint'>Output: LAN = TCP viewer on the port below; "
+              "Serial debug port = the debug UART (baud rate on the USB / "
+              "Serial page), no TCP socket is opened; Both = the two at the "
+              "same time, at the pace of the slower one. At 115200 baud the "
+              "serial port carries about 11 KB/s — with DEBUG level and a "
+              "busy layout lines may be dropped; raise the baud rate or "
+              "the minimum level.</p>"));
     _printField(c, "debug.tcp_log_enable", "Enabled");
+    _printField(c, "debug.log_output",     "Output");
     _printField(c, "debug.tcp_log_port",   "TCP port");
     c.print(F("</fieldset><fieldset><legend>Filtering</legend>"
               "<p class='hint'>Controls which lines are kept at all — "
@@ -1028,10 +1135,40 @@ void Webserver::_panelTraceLog(EthernetClient& c) {
 
     c.print(F("<fieldset><legend>Status</legend><table>"
               "<tr><td>Listening</td><td>"));
-    c.print(eepromStore().getBool("debug.tcp_log_enable", false) ? F("Yes") : F("No"));
+    c.print(eepromStore().getBool("debug.tcp_log_enable", false) &&
+            eepromStore().getUint8("debug.log_output", 0) != 1 ? F("Yes") : F("No"));
     c.print(F("</td></tr><tr><td>Client connected</td><td>"));
     c.print(traceLog().active() ? F("Yes") : F("No"));
     c.print(F("</td></tr></table></fieldset>"));
+
+    // Event log — readable without a trace viewer (see trace_log.h)
+    c.print(F("<fieldset><legend>Recent events</legend>"
+              "<p class='hint'>Warnings and errors (also when filtered out of the "
+              "trace above), client connections, track power on/off, core1 "
+              "stalls and the reason for the last restart. Newest first; kept "
+              "in memory, so they survive a lost trace viewer but not a "
+              "restart (the restart reason itself is listed after one). The "
+              "number in [ ] is the board time in ms.</p>"
+              "<table><tr><th>Ago</th><th>Event</th></tr>"));
+    {
+        uint32_t now = millis();
+        const char* txt; uint32_t ms;
+        uint8_t shown = 0;
+        for (uint8_t n = 0; n < 2 * TraceLog::EVENTS_PER_CORE; n++) {
+            if (!traceLog().eventAt(n, txt, ms)) break;
+            uint32_t ago = (now - ms) / 1000;
+            c.print(F("<tr><td>"));
+            if (ago >= 3600) { c.print(ago / 3600); c.print(F("h ")); c.print((ago % 3600) / 60); c.print(F("m")); }
+            else if (ago >= 60) { c.print(ago / 60); c.print(F("m ")); c.print(ago % 60); c.print(F("s")); }
+            else { c.print(ago); c.print(F("s")); }
+            c.print(F("</td><td>"));
+            _printEscaped(c, txt);
+            c.print(F("</td></tr>"));
+            shown++;
+        }
+        if (!shown) c.print(F("<tr><td colspan='2'>None</td></tr>"));
+    }
+    c.print(F("</table></fieldset>"));
     _shellClose(c);
 }
 
@@ -1083,41 +1220,149 @@ void Webserver::_panelDccHal(EthernetClient& c) {
     c.print(F("<h3>H-bridge status</h3>"
               "<table><tr><th>Bridge</th><th>nFAULT</th>"
               "<th>ACK state</th><th>SENSE (mV)</th><th>SENSE (raw ADC)</th>"
-              "<th>nFAULT count (raw)</th><th>nFAULT count (debounced)</th></tr>"));
-    struct BridgeRow { const HBridgeFault* fault; const DccCurrentMonitor* sense; };
+              "<th>nFAULT edges</th><th>nFAULT duty</th></tr>"));
+    struct BridgeRow { const NFaultSource* src; const DccCurrentMonitor* sense; };
     BridgeRow rows[] = {
-        { &gDccHal.faultDcc(), &gDccHal.senseDcc() },
-        { &gDccHal.faultSm(),  &gDccHal.senseSm()  },
-        { &gDccHal.faultCde(), &gDccHal.senseCde() },
+        { &gDccHal.srcDcc(), &gDccHal.senseDcc() },
+        { &gDccHal.srcSm(),  &gDccHal.senseSm()  },
+        { &gDccHal.srcCde(), &gDccHal.senseCde() },
     };
     for (auto& row : rows) {
-        c.print(F("<tr><td>")); c.print(row.fault->name());
+        c.print(F("<tr><td>")); c.print(row.src->name());
         c.print(F("</td><td>"));
-        c.print(row.fault->isFaulted() ? F("FAULT") : F("ok"));
+        c.print(row.src->isLow() ? F("FAULT") : F("ok"));
         c.print(F("</td><td>")); c.print(_ackStateName(row.sense->ackState()));
         c.print(F("</td><td>")); c.print(row.sense->lastMv());
         c.print(F("</td><td>")); c.print(row.sense->lastAdcValue());
-        c.print(F("</td><td>")); c.print(row.fault->faultCountRaw());
-        c.print(F("</td><td>")); c.print(row.fault->faultCount());
-        c.print(F("</td></tr>"));
+        c.print(F("</td><td>")); c.print(row.src->rawCount());
+        c.print(F("</td><td>")); c.print(row.src->dutyPermille() / 10);
+        c.print(F("."));         c.print(row.src->dutyPermille() % 10);
+        c.print(F("%</td></tr>"));
     }
     c.print(F("</table>"
-              "<p class='hint'>Counts since the last boot/reset (raw: every "
-              "individual nFAULT low, before debouncing; debounced: only "
-              "the filtered edges — see the RS485/USB/LAN trace log). Not "
-              "persisted across a power cycle by design.</p>"
+              "<p class='hint'>Edges: every high-to-low nFAULT edge since the "
+              "last boot/reset. Duty: smoothed share of time nFAULT is low — a "
+              "diagnostic only (about 0.3% on a healthy loco, about 48% on the "
+              "one that would not run). Not persisted across a power cycle by "
+              "design.</p>"
               "<form method='POST' action='/clear/hfaults'>"
               "<button class='btn' type='submit' "
               "onclick=\"return confirm('Reset all nFAULT counters?')\">"
               "Reset nFAULT counters</button></form>"));
-    c.print(F("<p class='hint'>Inrush protection (DCC/SM only — see the "
-              "System panel's own settings): "));
-    if (gDccHal.inrushActive()) {
-        c.print(F("currently ACTIVE for "));
-        c.print(gDccHal.inrushBridgeName());
-    } else {
-        c.print(F("idle"));
+
+    c.print(F("<h3>nFAULT guard</h3>"
+              "<table><tr><th>Bridge</th><th>State</th><th>Episodes</th>"
+              "<th>Micro short</th><th>ITRIP</th><th>OCP</th><th>Other</th>"
+              "<th>Inrush runs</th><th>Verify ok</th><th>(with stray edge)</th><th>Pairs skipped</th><th>ITRIP skipped (escalated)</th><th>Shorts</th>"
+              "<th>Power mW (now / max / limit)</th><th>Last short</th></tr>"));
+    struct GuardRow { const char* name; const HBridgeGuard* g; const char* limitKey; };
+    GuardRow grows[] = {
+        { "DCC", &gDccHal.guardDcc(), "dcc.pwr_mw" },
+        { "SM",  &gDccHal.guardSm(),  "sm.pwr_mw"  },
+        { "CDE", &gDccHal.guardCde(), nullptr      },
+    };
+    for (auto& gr : grows) {
+        c.print(F("<tr><td>")); c.print(gr.name);
+        c.print(F("</td><td>")); c.print(gr.g->stateName());
+        c.print(F("</td><td>")); c.print(gr.g->episodes());
+        c.print(F("</td><td>")); c.print(gr.g->nMicro());
+        c.print(F("</td><td>")); c.print(gr.g->nItrip());
+        c.print(F("</td><td>")); c.print(gr.g->nOcp());
+        c.print(F("</td><td>")); c.print(gr.g->nOther());
+        c.print(F("</td><td>")); c.print(gr.g->inrushCount());
+        c.print(F("</td><td>")); c.print(gr.g->verifyOk());
+        c.print(F("</td><td>")); c.print(gr.g->verifyStray());
+        c.print(F("</td><td>")); c.print(gr.g->skippedPairs());
+        c.print(F("</td><td>")); c.print(gr.g->skippedItrip());
+        c.print(F(" (")); c.print(gr.g->itripEscalated()); c.print(F(")"));
+        c.print(F("</td><td>")); c.print(gr.g->shortCount());
+        c.print(F("</td><td>"));
+        if (gr.limitKey) {
+            c.print(gr.g->powerMw());
+            c.print(F(" / "));
+            c.print(gr.g->powerMaxMw());
+            c.print(F(" / "));
+            c.print(eepromStore().getUint32(gr.limitKey, 2500));
+        } else {
+            c.print(F("-"));
+        }
+        c.print(F("</td><td>"));
+        c.print(gr.g->shortCount() ? gr.g->lastReason() : "");
+        c.print(F("</td></tr>"));
     }
+    c.print(F("</table>"
+              "<p class='hint'>Episodes: nFAULT events that started the state "
+              "machine. Micro short / ITRIP / OCP / Other: how they were "
+              "classified, from the pattern of edges (statistics only). "
+              "Settings: see the System panel. The inrush SENSE curves are "
+              "in the trace log.</p>"));
+
+    // nFAULT pulse lengths per classification — see hbridge_guard.h
+    c.print(F("<h3>nFAULT pulse length</h3>"
+              "<table><tr><th>Bridge</th>"
+              "<th>Micro short</th><th>ITRIP</th><th>OCP</th><th>Other</th>"
+              "<th>Last episode (pulse lengths in us)</th></tr>"));
+    for (auto& gr : grows) {
+        c.print(F("<tr><td>")); c.print(gr.name);
+        for (uint8_t k = 0; k < 4; k++) {
+            const HBridgeGuard::LowStats& ls = gr.g->lowStats(k);
+            c.print(F("</td><td>"));
+            if (ls.n) {
+                c.print(ls.minUs); c.print(F(" / "));
+                c.print(ls.avgUs()); c.print(F(" / "));
+                c.print(ls.maxUs); c.print(F(" us ("));
+                c.print(ls.n); c.print(F(")"));
+            } else {
+                c.print(F("-"));
+            }
+        }
+        c.print(F("</td><td>")); _printEscaped(c, gr.g->lastPulses());
+        c.print(F("</td></tr>"));
+    }
+    c.print(F("</table>"));
+
+    c.print(F("<p class='hint'>How long nFAULT stayed low per pulse, as min / avg / "
+              "max (number of pulses), for the pulses of each episode up to its "
+              "classification. This is how long the CHIP held nFAULT low, not how "
+              "long the short lasted: after an OCP the DRV8874 keeps nFAULT low "
+              "until its ~2 ms auto-retry however brief the cause, an ITRIP chop "
+              "lasts tens of us. So ~2000 us means the chip switched off (OCP), "
+              "tens of us means it only limited the current (ITRIP). Reset with "
+              "the nFAULT counters. Every episode's pulses are also in the trace "
+              "log.</p>"));
+
+    // Micro shorts in time
+    c.print(F("<h3>Micro shorts in time</h3>"
+              "<table><tr><th>Bridge</th><th>Micro shorts</th>"
+              "<th>Shortest gap between two</th>"
+              "<th>Within 1 s of the previous</th>"
+              "<th>Most within 1 s</th></tr>"));
+    for (auto& gr : grows) {
+        c.print(F("<tr><td>")); c.print(gr.name);
+        c.print(F("</td><td>")); c.print(gr.g->nMicro());
+        c.print(F("</td><td>"));
+        uint32_t gap = gr.g->microMinGapMs();
+        if (gap == 0) c.print(F("-"));
+        else if (gap < 10000) { c.print(gap); c.print(F(" ms")); }
+        else { c.print(gap / 1000); c.print(F(" s")); }
+        c.print(F("</td><td>")); c.print(gr.g->microFast());
+        c.print(F("</td><td>")); c.print((unsigned)gr.g->microBurstMax());
+        c.print(F("</td></tr>"));
+    }
+    c.print(F("</table>"
+              "<p class='hint'>Shortest gap: least time between two consecutive "
+              "micro shorts on that bridge. Within 1 s: how many came less than "
+              "1 s after the previous one. Most within 1 s: the largest burst. "
+              "A regular gap of many seconds is typically one loco hitting the "
+              "same spot every lap; bursts point at a bouncing wheel or a "
+              "loose contact. The trace log shows the time since the previous "
+              "episode on every \"nFAULT, episode\" line. Reset with the nFAULT "
+              "counters.</p>"));
+
+    c.print(F("<p class='hint'>Automatic restart after a short: "));
+    c.print(gDccHal.restartPending() ? F("pending") : F("none pending"));
+    c.print(F(", restarts used since the last manual power-on: "));
+    c.print((unsigned)gDccHal.restartCount());
     c.print(F(".</p>"));
     _shellClose(c);
 }
@@ -1489,6 +1734,11 @@ void Webserver::_panelXpressNet(EthernetClient& c) {
               "Lenz LZ100 behaviour). Addresses above 512 never get a "
               "broadcast, regardless of this setting.</p>"));
     _printField(c, "xn.sw_broadcast", "Broadcast after switching command (0x42)");
+    c.print(F("<p class='hint'>RS-485 only: answer a turnout command (0x52) "
+              "with the same command, as the Roco Z21 does. The MultiMaus "
+              "uses this to show the turnout position. Switch off if a Lenz "
+              "handheld (LH100) has trouble with it.</p>"));
+    _printField(c, "xn.rs485_sw_echo", "Echo turnout command to RS-485 handheld");
     c.print(F("</fieldset><button class='btn'>Save</button></form>"));
     _shellClose(c);
 }

@@ -29,6 +29,7 @@ void LnTcp::loop() {
         if (!c.active) continue;
 
         if (!c.tcp.connected()) {
+            c.tcp.setConnectionTimeout(100);
             c.tcp.stop();
             c.active   = false;
             c.msgLen   = 0;
@@ -244,6 +245,9 @@ void LnTcp::_injectAndRelay(const uint8_t* data, uint8_t len) {
 void LnTcp::_sendRaw(LnTcpClient& c, const LnMsg& msg) {
     uint8_t len = msg.length();
     traceLog().logBytes(TraceLevel::DEBUG, TraceSource::LNET, "TCP TX", msg.data, len);
+    // Non-blocking: drop when the TX buffer is full (peer not reading)
+    // instead of stalling core1 — same reasoning as LenzLan::_sendRaw().
+    if (c.tcp.availableForWrite() < (int)len) return;
     c.tcp.write(msg.data, len);
 }
 
@@ -255,6 +259,7 @@ void LnTcp::_sendAsciiReceive(LnTcpClient& c, const LnMsg& msg) {
         n += snprintf(line + n, sizeof(line) - (size_t)n, " %02X", msg.data[i]);
     }
     traceLog().logf(TraceLevel::DEBUG, TraceSource::LNET, "TCP TX: %s", line);
+    if (c.tcp.availableForWrite() < n + 2) return;   // non-blocking, see _sendRaw()
     c.tcp.print(line);
     c.tcp.print("\r\n");
 }

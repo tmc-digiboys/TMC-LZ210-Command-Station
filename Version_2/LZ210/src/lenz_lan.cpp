@@ -32,6 +32,9 @@
 #include <utility/w5100.h>   // For W5100.readSnMR/writeSnMR (No Delay ACK)
 #include "rs_bus_hal.h"
 #include "led_status.h"
+#include "eeprom_store.h"
+#include "command_bus.h"
+#include "xpressnet_handler.h"   // gCentrale
 
 static XpressNetHandler sXpressNet;  // Shared XpressNet parser for this server
 
@@ -201,6 +204,10 @@ void LenzLan::_acceptNew() {
 
     traceSerial.print("LenzLan: new client from ");
     traceSerial.println(newClient.remoteIP());
+    {
+        IPAddress nip = newClient.remoteIP();
+        traceLog().notef("[%lu] XN-LAN: new client %d.%d.%d.%d", millis(), nip[0], nip[1], nip[2], nip[3]);
+    }
 
     int8_t slot = -1;
     for (uint8_t i = 0; i < LENZ_LAN_MAX_CLIENTS; i++) {
@@ -215,6 +222,8 @@ void LenzLan::_acceptNew() {
     _clients[slot].rxLen     = 0;
     _clients[slot].progMode  = false;
     _clients[slot].lastActMs = millis();
+    _clients[slot].txStuckSinceMs = 0;
+    _clients[slot].txDropped      = 0;
     _clients[slot].active    = true;
     _connCount++;
     // Set No Delay ACK (ND) bit in W5500 socket mode register Sn_MR (bit 5).
@@ -332,11 +341,20 @@ void LenzLan::_acceptNew() {
 // ─────────────────────────────────────────────────────────────
 void LenzLan::_processClient(LenzClient& c) {
     if (!c.tcp.connected() && !c.tcp.available()) {
-        traceSerial.println("LenzLan: client disconnected");
+        // CLOSE_WAIT = the client closed the connection itself (clean).
+        // Anything else (CLOSED) = the W5500 gave up on a peer that no
+        // longer answered, or the peer reset it: treat as lost.
+        bool clean = c.tcp.status() == SnSR::CLOSE_WAIT;
+        traceSerial.println(clean ? "LenzLan: client disconnected"
+                                  : "LenzLan: client lost (peer not answering)");
+        if (clean) traceLog().notef("[%lu] XN-LAN: client %d.%d.%d.%d closed the connection",
+                                    millis(), c.ip[0], c.ip[1], c.ip[2], c.ip[3]);
+        c.tcp.setConnectionTimeout(100);
         c.tcp.stop();
         c.active   = false;
         c.progMode = false;
         _connCount--;
+        if (!clean) _onClientLost(c, "peer not answering");
         return;
     }
 
@@ -480,11 +498,115 @@ void LenzLan::_processFrame(LenzClient& c, const uint8_t* buf, uint8_t len) {
 //  LED. Does nothing if the client slot is inactive or the length is
 //  zero.
 // ─────────────────────────────────────────────────────────────
+//
+//  NON-BLOCKING (Oct 2026). This used to be write() + flush(). flush()
+//  waits until the W5500's TX buffer is empty, i.e. until the peer has
+//  ACKed everything. When the PC running Rocrail went to sleep, nothing
+//  was ACKed any more: core1 sat in flush() inside an EventBus feedback
+//  broadcast, the core1-stall check cut track power and the watchdog
+//  reset the board (boot report: "core1 was at: EventBus.poll").
+//  Now:
+//   - no flush(): write() already issues the SEND command, so each
+//     call still goes out as its own TCP segment;
+//   - only write when the TX buffer has room for the whole frame;
+//     otherwise drop the frame (counted) instead of waiting;
+//   - a client whose TX buffer has had no room for LENZ_LAN_TX_STALL_MS
+//     is closed (frozen peer with a zero window — a peer that does not
+//     answer at all is closed by the W5500 itself after the
+//     retransmission timeout set in setup1(), and then torn down by
+//     _processClient()).
 void LenzLan::_sendRaw(LenzClient& c, const uint8_t* buf, uint8_t len) {
     if (!c.active || len == 0) return;
+    if (!c.tcp.connected()) return;          // torn down in _processClient()
+    uint32_t now = millis();
+    if (c.tcp.availableForWrite() < (int)len) {
+        if (c.txStuckSinceMs == 0) c.txStuckSinceMs = now ? now : 1;
+        c.txDropped++;
+        if (now - c.txStuckSinceMs > LENZ_LAN_TX_STALL_MS) _dropClient(c, "TX buffer full too long");
+        return;
+    }
+    c.txStuckSinceMs = 0;
     c.tcp.write(buf, len);
-    c.tcp.flush();
     gLeds.onEthernetTraffic();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  _dropClient() — close a client slot without blocking
+//
+//  EthernetClient::stop() waits up to its connection timeout (1s by
+//  default) for the peer to acknowledge the close; for a dead peer
+//  that whole second would stall core1. Shortened to 100ms first.
+// ─────────────────────────────────────────────────────────────
+void LenzLan::_dropClient(LenzClient& c, const char* why) {
+    if (!c.active) return;
+    traceLog().logf(TraceLevel::WARNING, TraceSource::XN_LAN,
+                    "closing client %d.%d.%d.%d:%u: %s (%lu frames dropped)",
+                    c.ip[0], c.ip[1], c.ip[2], c.ip[3], c.port, why,
+                    (unsigned long)c.txDropped);
+    c.tcp.setConnectionTimeout(100);
+    c.tcp.stop();
+    c.active   = false;
+    c.progMode = false;
+    if (_connCount) _connCount--;
+    _onClientLost(c, why);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  _onClientLost() — a client disappeared without closing its
+//  connection
+//
+//  Why (Rob, Oct 2026): when the PC running Rocrail went to sleep,
+//  every loco kept running with its last speed and turnouts were no
+//  longer set — nothing told the station the controller was gone.
+//  Simply stopping when "no LenzLAN client" is wrong: a layout can be
+//  run from RS-485 or LocoNet handhelds alone. So this reacts only to
+//  an UNEXPECTED loss of a client that was there:
+//    - lifecheck missed (_checkTimeouts),
+//    - peer stopped answering: the W5500 gave up retransmitting and
+//      closed the socket (status CLOSED instead of CLOSE_WAIT),
+//    - TX buffer full for too long (_sendRaw).
+//  A clean close by the client itself (FIN -> CLOSE_WAIT, e.g. Rocrail
+//  shutting down) does nothing.
+//
+//  "xn.lan_lost_action" (LenzLAN page):
+//    0 = do nothing (previous behaviour)
+//    1 = emergency-stop the locos last driven via LenzLAN (default);
+//        locos driven from a handheld carry on
+//    2 = track power off (everything stops)
+//  Only while track power is on. Note: with several LenzLAN clients,
+//  option 1 stops every loco last driven via LenzLAN, not only those
+//  of the client that was lost (commands carry the module, not the
+//  client).
+// ─────────────────────────────────────────────────────────────
+void LenzLan::_onClientLost(const LenzClient& c, const char* why) {
+    _lostCount++;
+    _lastLostMs = millis();
+    snprintf(_lastLostWhy, sizeof(_lastLostWhy), "%s", why);
+    uint8_t action = eepromStore().getUint8("xn.lan_lost_action", 1);
+    if (action == 0 || gCentrale.trackPowerOff) {
+        traceLog().logf(TraceLevel::WARNING, TraceSource::XN_LAN,
+                        "client %d.%d.%d.%d lost (%s) -> no action (%s)",
+                        c.ip[0], c.ip[1], c.ip[2], c.ip[3], why,
+                        action == 0 ? "setting: do nothing" : "track power already off");
+        return;
+    }
+    if (action == 0) return;
+    if (gCentrale.trackPowerOff) return;
+    traceLog().logf(TraceLevel::WARNING, TraceSource::XN_LAN,
+                    "client %d.%d.%d.%d lost (%s) -> %s",
+                    c.ip[0], c.ip[1], c.ip[2], c.ip[3], why,
+                    action == 2 ? "TRACK POWER OFF" : "emergency stop of LenzLAN locos");
+    Command cmd{};
+    cmd.sourceId = ModuleId::LENZ_LAN;
+    if (action == 2) {
+        gCentrale.trackPowerOff = true;
+        gCentrale.emergencyStop = false;
+        cmd.type = CmdType::POWER_OFF;
+    } else {
+        cmd.type    = CmdType::STOP_LOCOS_OF;
+        cmd.address = ModuleId::LENZ_LAN;
+    }
+    CommandBus::instance().dispatch(cmd);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -688,7 +810,11 @@ void LenzLan::_flushPendingFeedback() {
 void LenzLan::_sendFeedbackBulk(const uint8_t* addr, const uint8_t* data,
                                   uint8_t count) {
     if (count == 0 || _connCount == 0) {
-        traceLog().logf(TraceLevel::WARNING, TraceSource::XN_LAN,
+        // Normal when no LenzLAN client is connected (e.g. after the PC
+        // went to sleep): DEBUG, not WARNING — as a WARNING it flooded
+        // the event log on every feedback change and pushed the real
+        // events (client lost, emergency stop) out of it.
+        traceLog().logf(TraceLevel::DEBUG, TraceSource::XN_LAN,
                          "_sendFeedbackBulk early-return: count=%u connCount=%u",
                          count, _connCount);
         return;
@@ -766,10 +892,12 @@ void LenzLan::_checkTimeouts() {
             traceLog().logf(TraceLevel::WARNING, TraceSource::XN_LAN, "TIMEOUT %d.%d.%d.%d:%u idle=%lums threshold=%lums",
                              ip[0], ip[1], ip[2], ip[3], _clients[i].tcp.remotePort(),
                              (unsigned long)idleMs, (unsigned long)timeout);
+            _clients[i].tcp.setConnectionTimeout(100);
             _clients[i].tcp.stop();
             _clients[i].active   = false;
             _clients[i].progMode = false;
             _connCount--;
+            _onClientLost(_clients[i], "lifecheck missed");
         }
     }
 }

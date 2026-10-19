@@ -163,6 +163,10 @@ public:
     // should prefer the TraceSource-based overloads above so they can
     // be filtered individually.
     void logf(const char* source, const char* fmt, ...);
+    // A complete line that traceSerial has already written to Serial2
+    // itself: pushed into the ring marked "echoed", so the serial output
+    // of the ring skips it (no double lines on the debug port).
+    void logEchoed(const char* text);
     void logBytes(const char* source, const char* direction,
                   const uint8_t* data, uint8_t len);
 
@@ -178,9 +182,29 @@ public:
     // call site, which is already non-const context via traceLog()).
     bool active() { return _enabledCached && _client && _client.connected(); }
 
+    // ── Event log (Oct 2026) ──────────────────────────────────
+    // A small separate buffer of the lines that matter after the fact:
+    // every WARNING/ERROR logged via logf() (also when filtered out of
+    // the trace), plus lines added with notef() — connections, power
+    // on/off, core1 stalls, the reset report. Unlike the trace ring it
+    // never fills up and stops: the oldest entry is overwritten. It is
+    // shown on the web interface (Debug Log page), so it can be read
+    // without a trace viewer — the viewer usually runs on the very PC
+    // whose disappearance is being investigated, and once it is gone
+    // the trace ring fills within seconds and drops everything after.
+    // One ring per core, each written only by its own core (lock-free);
+    // a line being overwritten while the web page reads it can come
+    // out garbled, which is acceptable for a diagnostic view.
+    void notef(const char* fmt, ...);
+    static constexpr uint8_t EVENTS_PER_CORE = 16;
+    // n-th most recent event over both cores (0 = newest). false when
+    // there are fewer. msOut = millis() when it was recorded.
+    bool eventAt(uint8_t n, const char*& textOut, uint32_t& msOut) const;
+
 private:
     struct Entry {
         char text[TRACE_LOG_MSG_MAX];
+        bool echoed;   // already written to Serial2 directly by traceSerial
     };
 
     // Lock-free ring buffer (any core writes via _push(), core1 reads
@@ -197,8 +221,23 @@ private:
 
     EthernetServer* _server = nullptr;
     EthernetClient  _client;
+    uint32_t        _txStuckSinceMs = 0;   // 0 = sending fine; else when the TX buffer first lacked room
 
-    bool _push(const char* text);
+    bool _push(const char* text, bool echoed = false);
+
+    // Output selection ("debug.log_output"): 0 = LAN (TCP viewer),
+    // 1 = serial debug port (Serial2), 2 = both. With serial only, no
+    // TCP socket is opened. Serial output is written without blocking:
+    // one line at a time, only as many characters as the UART TX FIFO
+    // accepts per loop() pass (see _serialPump()).
+    uint8_t  _outputCached = 0;
+    char     _serBuf[TRACE_LOG_MSG_MAX + 2];
+    uint16_t _serLen = 0, _serPos = 0;      // _serPos < _serLen = line in progress
+    void     _serialPump();
+    void _note(const char* text);
+    struct EvEntry { uint32_t ms; bool used; char text[TRACE_LOG_MSG_MAX]; };
+    EvEntry           _ev[2][EVENTS_PER_CORE] = {};
+    volatile uint8_t  _evHead[2] = {0, 0};
     bool _pop(Entry& out);
 
     // _passesFilter() — the shared level+source check used by both
@@ -264,7 +303,7 @@ private:
         LineBuf& lb = _line[get_core_num() & 1];
         if (c == '\n') {
             lb.text[lb.len] = '\0';
-            if (lb.len > 0) traceLog().logf("", "%s", lb.text);
+            if (lb.len > 0) traceLog().logEchoed(lb.text);
             lb.len = 0;
         } else if (c != '\r') {
             if (lb.len < TRACE_LOG_MSG_MAX - 1) lb.text[lb.len++] = (char)c;
@@ -273,3 +312,20 @@ private:
 };
 
 extern TraceSerial traceSerial;
+
+// NotePrint — a Print that writes to traceSerial AND records each
+// complete line in the event log (TraceLog::notef). Used for the boot
+// reset report (CrashDiag::reportAndReset) so it is visible on the web
+// page too.
+class NotePrint : public Print {
+public:
+    size_t write(uint8_t c) override {
+        traceSerial.write(c);
+        if (c == '\n') { _buf[_len] = '\0'; if (_len) traceLog().notef("%s", _buf); _len = 0; }
+        else if (c != '\r' && _len < sizeof(_buf) - 1) _buf[_len++] = (char)c;
+        return 1;
+    }
+private:
+    char    _buf[TRACE_LOG_MSG_MAX];
+    uint8_t _len = 0;
+};

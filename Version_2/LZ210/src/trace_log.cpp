@@ -93,30 +93,101 @@ void TraceLog::loop() {
     _refreshConfig();
     if (!_enabledCached) return;
 
+    const bool lan = _outputCached != 1;   // 0 = LAN, 2 = both
+    const bool ser = _outputCached != 0;   // 1 = serial, 2 = both
+
     // Accept a new client if one is waiting — replaces whatever was
     // previously connected (single-viewer model, see trace_log.h).
-    if (_server) {
+    //
+    // SOCKET LEAK fixed (Oct 2026, Rob: disconnect + reconnect the trace
+    // viewer a few times and all 8 W5500 sockets are used up). The old
+    // client was only stopped when it was still "connected()"; after
+    // the viewer disconnects it sits in CLOSE_WAIT, which is NOT
+    // connected(), so it was never stopped and kept its socket forever
+    // ("W23456" in the socket log). Now the old client is always
+    // stopped on a new connection, and a client that is no longer
+    // connected is stopped right away.
+    if (lan && _server) {
         EthernetClient incoming = _server->accept();
         if (incoming) {
-            if (_client && _client.connected()) _client.stop();
+            if (_client) { _client.setConnectionTimeout(100); _client.stop(); }
             _client = incoming;
+            _txStuckSinceMs = 0;
+            notef("[%lu] TraceLog: viewer connected", millis());
         }
     }
+    if (lan && _client && !_client.connected()) {   // viewer went away: free the socket
+        notef("[%lu] TraceLog: viewer disconnected", millis());
+        _client.setConnectionTimeout(100);
+        _client.stop();
+    }
+    const bool lanReady = lan && _client && _client.connected();
 
-    if (!_client || !_client.connected()) return;
+    // Serial: first finish the line that is still going out.
+    if (ser) _serialPump();
 
     // Drain a bounded number of pending entries per call, so a large
-    // backlog (e.g. logging resumed after being off for a while)
-    // cannot itself turn into a long, blocking burst — matching the
-    // exact lesson from the earlier ring-buffer dump mistake this
-    // project ran into (see trace_log.h's comment). Remaining entries
-    // simply wait for the next loop() call.
-    const uint8_t kMaxDrainPerCall = 4;
+    // backlog cannot turn into a long, blocking burst. An entry is only
+    // taken from the ring when every active output can take it:
+    //   - TCP: room for a whole line in the W5500 TX buffer. A viewer
+    //     that stops reading (PC asleep, frozen) would otherwise block
+    //     core1 in print(); after TRACE_TX_STALL_MS without room the
+    //     viewer is dropped and the entries stay for the next one.
+    //   - serial: the previous line has gone out completely (one line in
+    //     flight at a time, written by _serialPump() without blocking).
+    // With "both", the slower of the two sets the pace.
+    // With LAN only and no viewer connected nothing is drained, as
+    // before, so a viewer that connects later gets the backlog.
+    const uint8_t  kMaxDrainPerCall = 4;
+    const uint32_t TRACE_TX_STALL_MS = 5000;
     Entry e;
     for (uint8_t i = 0; i < kMaxDrainPerCall; i++) {
+        if (!lanReady && !ser) break;
+        if (ser && _serPos < _serLen) break;                     // serial line still busy
+        if (lanReady && _client.availableForWrite() < (int)(TRACE_LOG_MSG_MAX + 2)) {
+            uint32_t now = millis();
+            if (_txStuckSinceMs == 0) _txStuckSinceMs = now ? now : 1;
+            if (now - _txStuckSinceMs > TRACE_TX_STALL_MS) {
+                Serial2.println("TraceLog: viewer not reading, connection closed");
+                notef("[%lu] TraceLog: viewer not reading, connection closed", millis());
+                _client.setConnectionTimeout(100);
+                _client.stop();
+                _txStuckSinceMs = 0;
+            }
+            break;
+        }
+        _txStuckSinceMs = 0;
         if (!_pop(e)) break;
-        _client.print(e.text);
-        _client.print("\r\n");
+        if (lanReady) {
+            _client.print(e.text);
+            _client.print("\r\n");
+        }
+        // Lines traceSerial already wrote to Serial2 itself are not
+        // written again.
+        if (ser && !e.echoed) {
+            int n = snprintf(_serBuf, sizeof(_serBuf), "%s\r\n", e.text);
+            if (n < 0) n = 0;
+            if (n > (int)sizeof(_serBuf) - 1) n = sizeof(_serBuf) - 1;
+            _serLen = (uint16_t)n;
+            _serPos = 0;
+            _serialPump();
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  _serialPump() — write the pending serial line without blocking
+//
+//  Serial2 (UART) has a small hardware TX FIFO and write() blocks once
+//  it is full; a 160-character line takes ~14ms at 115200 baud. So only
+//  as many characters as the FIFO accepts right now are written; the
+//  rest goes out on the next loop() passes. Note: traceSerial (either
+//  core) writes its own lines to Serial2 directly and whole; such a line
+//  can occasionally land in the middle of one of these.
+// ─────────────────────────────────────────────────────────────
+void TraceLog::_serialPump() {
+    while (_serPos < _serLen && Serial2.availableForWrite() > 0) {
+        Serial2.write((uint8_t)_serBuf[_serPos++]);
     }
 }
 
@@ -191,7 +262,11 @@ bool TraceLog::_passesFilter(TraceLevel level, TraceSource source) {
 //  gates on _enabledCached.
 // ─────────────────────────────────────────────────────────────
 void TraceLog::logf(TraceLevel level, TraceSource source, const char* fmt, ...) {
-    if (!_passesFilter(level, source)) return;
+    // WARNING/ERROR always go to the event log, even when the trace
+    // filter hides them (see notef()).
+    bool pass      = _passesFilter(level, source);
+    bool important = (uint8_t)level >= (uint8_t)TraceLevel::WARNING;
+    if (!pass && !important) return;
 
     const char* tag = traceSourceTag(source);
     char msg[TRACE_LOG_MSG_MAX];
@@ -207,7 +282,60 @@ void TraceLog::logf(TraceLevel level, TraceSource source, const char* fmt, ...) 
     vsnprintf(msg + n, sizeof(msg) - (size_t)n, fmt, args);
     va_end(args);
 
-    _push(msg);
+    if (important) _note(msg);
+    if (pass)      _push(msg);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Event log — see trace_log.h
+// ─────────────────────────────────────────────────────────────
+void TraceLog::notef(const char* fmt, ...) {
+    char msg[TRACE_LOG_MSG_MAX];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+    _note(msg);
+}
+
+void TraceLog::logEchoed(const char* text) {
+    // Same filter as the string-tag logf() overload these lines used
+    // to go through (INFO, SYSTEM source).
+    if (!_passesFilter(TraceLevel::INFO, TraceSource::SYSTEM)) return;
+    _push(text, true);
+}
+
+void TraceLog::_note(const char* text) {
+    uint8_t core = get_core_num() & 1;
+    uint8_t i    = _evHead[core];
+    EvEntry& e   = _ev[core][i];
+    e.used = false;                      // mark while rewriting
+    strncpy(e.text, text, TRACE_LOG_MSG_MAX - 1);
+    e.text[TRACE_LOG_MSG_MAX - 1] = '\0';
+    e.ms   = millis();
+    e.used = true;
+    _evHead[core] = (uint8_t)((i + 1) % EVENTS_PER_CORE);
+}
+
+bool TraceLog::eventAt(uint8_t n, const char*& textOut, uint32_t& msOut) const {
+    // Collect the used entries of both rings, sort by age (newest
+    // first) and pick the n-th. At most 32 entries.
+    struct Ref { uint32_t age; uint8_t c, i; };
+    Ref refs[2 * EVENTS_PER_CORE];
+    uint8_t cnt = 0;
+    uint32_t now = millis();
+    for (uint8_t c = 0; c < 2; c++)
+        for (uint8_t i = 0; i < EVENTS_PER_CORE; i++)
+            if (_ev[c][i].used) refs[cnt++] = { now - _ev[c][i].ms, c, i };
+    if (n >= cnt) return false;
+    for (uint8_t a = 1; a < cnt; a++) {            // insertion sort
+        Ref r = refs[a]; int8_t b = (int8_t)a - 1;
+        while (b >= 0 && refs[b].age > r.age) { refs[b + 1] = refs[b]; b--; }
+        refs[b + 1] = r;
+    }
+    textOut = _ev[refs[n].c][refs[n].i].text;
+    msOut   = _ev[refs[n].c][refs[n].i].ms;
+    return true;
 }
 
 void TraceLog::logf(const char* source, const char* fmt, ...) {
@@ -301,11 +429,12 @@ void TraceLog::logBytes(const char* source, const char* direction,
 //  message) if the buffer is currently full, rather than blocking
 //  the caller.
 // ─────────────────────────────────────────────────────────────
-bool TraceLog::_push(const char* text) {
+bool TraceLog::_push(const char* text, bool echoed) {
     uint8_t nextHead = (uint8_t)((_head + 1) % TRACE_LOG_RING_SIZE);
     if (nextHead == _tail) return false;  // ring full — drop newest
     strncpy(_ring[_head].text, text, TRACE_LOG_MSG_MAX - 1);
     _ring[_head].text[TRACE_LOG_MSG_MAX - 1] = '\0';
+    _ring[_head].echoed = echoed;
     _head = nextHead;
     return true;
 }
@@ -323,10 +452,19 @@ bool TraceLog::_pop(Entry& out) {
 void TraceLog::_refreshConfig() {
     bool     enabled = eepromStore().getBool("debug.tcp_log_enable", false);
     uint16_t port    = eepromStore().getUint16("debug.tcp_log_port", TRACE_LOG_PORT_DEFAULT);
+    uint8_t  output  = eepromStore().getUint8("debug.log_output", 0);
+    if (output > 2) output = 0;
 
-    if (enabled == _enabledCached && port == _portCached) return;  // unchanged
+    // The TCP side only exists when output is LAN or both; with serial
+    // only, it is handled exactly like "disabled" below (no socket).
+    bool tcpWanted = enabled && output != 1;
+    bool tcpNow    = _enabledCached && _outputCached != 1;
+    bool same      = enabled == _enabledCached && output == _outputCached && port == _portCached;
+    _outputCached  = output;
+    if (same) return;  // unchanged
+    if (tcpWanted == tcpNow && port == _portCached) { _enabledCached = enabled; return; }
 
-    if (!enabled) {
+    if (!tcpWanted) {
         // Just turned off — close everything.
         if (_client) _client.stop();
         // Destroy via explicit dtor + operator delete rather than
@@ -336,7 +474,7 @@ void TraceLog::_refreshConfig() {
         // and well-defined, but avoids the compiler's (otherwise
         // correct in general) -Wdelete-non-virtual-dtor warning.
         if (_server) { _server->~EthernetServer(); ::operator delete(_server); _server = nullptr; }
-        _enabledCached = false;
+        _enabledCached = enabled;
         _portCached    = port;
         return;
     }

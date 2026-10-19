@@ -577,6 +577,16 @@ void XpressNetRs485::_processSlaveReply(uint8_t addr,
         pio_sm_clear_fifos(pio2, 1);
         pio_sm_set_enabled(pio2, 1, true);
     }
+    // REPLY_RAW: the response as plain data words, no call byte first —
+    // the Z21PG's turnout echo (see XpressNetHandler::handleTurnout()).
+    if (r == XNHandleResult::REPLY_RAW && respLen > 0) {
+        pio_sm_set_enabled(pio2, 1, false);
+        _txMode();
+        _sendData(resp, respLen);
+        _rxMode();
+        pio_sm_clear_fifos(pio2, 1);
+        pio_sm_set_enabled(pio2, 1, true);
+    }
     // For BROADCAST_ONLY, flush immediately so the MultiMaus receives the
     // broadcast within its own response timeout
     if (r == XNHandleResult::BROADCAST_ONLY) {

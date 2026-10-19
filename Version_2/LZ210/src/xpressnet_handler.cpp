@@ -1132,6 +1132,28 @@ XNHandleResult XpressNetHandler::handleTurnout(const uint8_t* in, uint8_t il,
     // own responsibility to (re)establish, same as those.
 
     if (!dispatched) { l = buildError(r, 0x1F); return XNHandleResult::REPLY; }
+
+    // RS-485: echo the command back unchanged, immediately and WITHOUT
+    // a call byte in front (REPLY_RAW). The Roco reference (Z21PG, Rob
+    // Oct 2026, bus trace) does exactly this — handheld sends
+    // 52 00 89 DB, station answers 52 00 89 DB as plain data words while
+    // the handheld is still listening after its own transmission — and
+    // the MultiMaus uses it to set its turnout icon. Without it the
+    // icon showed the wrong position. (A first version sent it as a
+    // normal REPLY, i.e. with call byte 0x60|address: not what the
+    // Z21PG does, and the MultiMaus ignored it.)
+    // Earlier attempt only echoed to a slave detected as MultiMaus, but
+    // the RS-485 module never actually sets a slave type (always 0), so
+    // nothing was ever sent. Now for every RS-485 device, switchable
+    // ("xn.rs485_sw_echo", XpressNet page) in case a Lenz handheld
+    // (LH100) turns out not to like it. LAN/USB unchanged.
+    if (_srcId == ModuleId::XPRESSNET_RS485 && il >= 4 &&
+        eepromStore().getBool("xn.rs485_sw_echo", true)) {
+        r[0] = in[0]; r[1] = in[1]; r[2] = in[2];
+        r[3] = xorCheck(r, 3);
+        l = 4;
+        return XNHandleResult::REPLY_RAW;
+    }
     l = buildOk(r); return XNHandleResult::OK_SILENT;
 }
 
@@ -1215,6 +1237,28 @@ XNHandleResult XpressNetHandler::handleSwitchQuery(const uint8_t* in, uint8_t il
     if (il < 3) { l = buildError(r, 0x82); return XNHandleResult::REPLY; }
 
     // Variant B: nibble selector present
+    //
+    // The same request is used for feedback modules AND for turnout
+    // (accessory) decoders — the address space is shared and the
+    // station answers with the type it knows. Previously this always
+    // answered as a feedback module: for a turnout group without an
+    // RS-Bus module at that address the answer was TT=00 with ZZZZ=0
+    // ("not yet switched"), so the MultiMaus turnout icon fell back
+    // after its own command (Rob, Oct 2026). Now:
+    //   - RS-Bus module seen at this address -> feedback answer, as before
+    //   - otherwise -> accessory decoder without feedback (TT=00) with
+    //     the position of the two turnouts of this nibble, in the form
+    //     the Roco reference sends it (Z21PG bus trace, Rob Oct 2026:
+    //     request 42 00 80 C2 -> answer [call byte] 42 00 85 C7):
+    //       bit 7 (I) set, as the Z21PG does
+    //       Z1Z0 = first turnout, Z3Z2 = second turnout
+    //       01 = last command D2=0 (output 1) — also when not switched
+    //            yet: the Z21PG reports 01 for both, never 00
+    //       10 = last command D2=1 (output 2)
+    //     (gAccessories holds what the clients sent: state bit 1 = D2=0)
+    //   Sent with the normal call byte (the Z21PG does: 1E4 before 42).
+    //   ASSUMPTION to verify: 10 for D2=1. If the icon is now exactly
+    //   the wrong way round, swap 0x01/0x02 below.
     if (il >= 4 && (in[2] == 0x80 || in[2] == 0x81)) {
         uint8_t protoAddr = in[1];                // §2.15: protocol address 0-127
         uint8_t hwAddr    = protoAddr + 1;        // RS-Bus hardware address 1-128
@@ -1222,7 +1266,18 @@ XNHandleResult XpressNetHandler::handleSwitchQuery(const uint8_t* in, uint8_t il
         bool    present   = (protoAddr <= 127) && gRsBusHal.isSeen(hwAddr);
         uint8_t nibData   = present ? gRsBusHal.getNibble(hwAddr, nibble) : 0;
         uint8_t tt        = present ? gRsBusHal.getType(hwAddr) : 0;
-        uint8_t itnz      = ((tt & 0x03) << 5) | (nibble ? 0x10 : 0x00)
+        uint8_t iBit = 0;
+        if (!present) {
+            iBit = 0x80;
+            for (uint8_t k = 0; k < 2; k++) {
+                uint16_t a = (uint16_t)protoAddr * 4 + nibble * 2 + k + 1;
+                bool p1 = a < MAX_ACCESSORIES && gAccessories[a].known
+                          && !(gAccessories[a].state & 0x01);       // D2=1
+                uint8_t z = p1 ? 0x02 : 0x01;
+                nibData |= (uint8_t)(z << (k * 2));
+            }
+        }
+        uint8_t itnz      = iBit | ((tt & 0x03) << 5) | (nibble ? 0x10 : 0x00)
                            | (nibData & 0x0F);
         r[0] = 0x42; r[1] = protoAddr; r[2] = itnz;
         r[3] = xorCheck(r, 3); l = 4;
@@ -1252,6 +1307,8 @@ XNHandleResult XpressNetHandler::handleSwitchQuery(const uint8_t* in, uint8_t il
     r[4] = xorCheck(r, 4); l = 5;
     return XNHandleResult::REPLY;
 }
+
+
 
 // ─────────────────────────────────────────────────────────────
 // handleProgRead — starts a CV read in service/programming mode.

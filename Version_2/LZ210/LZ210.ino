@@ -117,6 +117,7 @@
 #include <Ethernet.h>
 #include <EthernetBonjour.h>
 #include "hardware/watchdog.h"
+#include "src/crash_diag.h"
 
 // Fallback MAC address and IP, used only if the corresponding
 // EEPROM-stored values ("net.mac"/"net.ip") are missing or invalid —
@@ -144,6 +145,11 @@ volatile bool gCore0Ready      = false;
 // loopt door" — a hang in EITHER core must trigger a reset, not just a
 // core0 hang. See loop()'s own comment for how this value is used.
 volatile uint32_t gCore1LastAliveMs = 0;
+
+// gCore1Running — set by loop1() after its first complete iteration.
+// Until then core1 is still in setup1() (Ethernet/DHCP can take
+// seconds), which must not count as a stall.
+volatile bool gCore1Running = false;
 
 // gEthernetUsesDhcp — set true in setup1() only if Ethernet.begin()
 // with DHCP actually succeeded. Read by ModuleRegistry::loopCore1()
@@ -333,6 +339,17 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     bool r3 = registry().add(&gLenzLan);
     bool r4 = registry().add(&gLenzUsb);
     bool r5 = registry().add(&gZ21Lan);
+    // Protocols switched off on the web interface: never begun, never
+    // looped, no EventBus handler — and therefore no W5500 socket.
+    // Read once at boot; a change needs a restart.
+    if (!eepromStore().getBool("lenz.enable", true)) {
+        gLenzLan.setEnabled(false);
+        traceSerial.println("LenzLan: disabled (lenz.enable = off), no socket opened");
+    }
+    if (!eepromStore().getBool("z21.enable", true)) {
+        gZ21Lan.setEnabled(false);
+        traceSerial.println("Z21Lan: disabled (z21.enable = off), no socket opened");
+    }
     bool r5b = registry().add(&gTraceLog);
     gOled.showStatus("LenzLan", r3);
     gOled.showStatus("LenzUsb", r4);
@@ -364,6 +381,18 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
     gOled.showPower(false);
 
     traceSerial.println("Core0 ready\r\n");
+
+    // Why did we (re)start, and — after a watchdog reset — where was
+    // each core? Must run before anything writes a breadcrumb (the
+    // core0 loop, and core1, which is still waiting on gCore0Ready)
+    // and before watchdog_enable(). Placed after registration so the
+    // module indices in the breadcrumbs resolve to names. See
+    // crash_diag.h.
+    static NotePrint sResetOut;   // also into the web event log
+    CrashDiag::reportAndReset(sResetOut, [](uint8_t i) -> const char* {
+        ModuleBase* m = registry().at(i);
+        return m ? m->name() : nullptr;
+    });
     __dmb();
 
     // Startup power state — configurable via the web interface's DCC
@@ -472,10 +501,92 @@ pinMode(HW_EXT_GPIO_7, OUTPUT);
 //  5. Calls registry().loopCore0(), which itself polls CommandBus again
 //     and then calls loop() on every registered CORE0/BOTH module.
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+//  _checkCore1Stall() — core0: cut track power when core1 stops
+//
+//  All networking runs on core1 (LenzLAN/Rocrail, Z21, LocoNet-over-
+//  TCP, web, trace log). If core1 hangs, core0 keeps refreshing DCC
+//  with the last known speeds: every loco keeps running and nothing
+//  can stop it, until the watchdog resets the board 4 + 8 = ~12s
+//  later. That happened (Rob, Oct 2026): locos stopped responding to
+//  Rocrail, one ran onto the wrong track into another loco, then the
+//  board restarted.
+//
+//  So as soon as core1 has shown no sign of life for longer than
+//  "sys.core1_stall_ms" (default 2000, 0 = off), core0 switches track
+//  power off itself, logs where core1 is (breadcrumb) and marks it
+//  for the post-reset report. The watchdog behaviour is unchanged.
+//  Power stays off if core1 recovers: switching it back on is the
+//  user's / Rocrail's decision (core1 broadcasts the power-off to
+//  the clients as soon as it runs again).
+//
+//  The heartbeat is updated after EVERY core1 module call
+//  (ModuleRegistry::loopCore1()), so the limit is about a single
+//  module call, not a whole loop1() pass. Known legitimate long
+//  calls on core1: a web request (up to ~1-2s for a slow client) and
+//  a DHCP renewal in Ethernet.maintain() (rare). If the log shows a
+//  false trip in one of those, raise the setting.
+// ─────────────────────────────────────────────────────────────
+static void _checkCore1Stall() {
+    static uint32_t sLimitMs     = 2000;
+    static uint32_t sLimitReadMs = 0;
+    static bool     sTripped     = false;
+    static uint32_t sTripAge     = 0;
+
+    uint32_t now = millis();
+    if (now - sLimitReadMs >= 2000) {       // EEPROM read is a table lookup; not every pass
+        sLimitReadMs = now;
+        sLimitMs = eepromStore().getUint16("sys.core1_stall_ms", 2000);
+    }
+    if (!gCore1Running || sLimitMs == 0) return;
+
+    // Read the heartbeat ONCE, then compare signed: core1 writes
+    // gCore1LastAliveMs = millis() concurrently, so it is regularly
+    // 1 ms NEWER than `now` read above. Unsigned, now - last then
+    // wrapped to 4294967295 and tripped this check falsely (Rob, Oct
+    // 2026: "stalled 4294967295 ms" in random modules — the module
+    // name was simply wherever core1 happened to be).
+    uint32_t last = gCore1LastAliveMs;
+    int32_t  diff = (int32_t)(now - last);
+    uint32_t age  = diff > 0 ? (uint32_t)diff : 0;
+    if (age > sLimitMs) {
+        if (!sTripped) {
+            sTripped = true;
+            sTripAge = age;
+            bool wasOn = gDccHal.getPower();
+            // Power first, logging after: if core1 hung while holding
+            // something the log path needs, track power is off anyway.
+            if (wasOn) {
+                gCentrale.trackPowerOff = true;
+                gCentrale.emergencyStop = false;
+                gDccHal.setPower(false);
+            }
+            CrashDiag::setFlag(CrashDiag::F_CORE1_STALL);
+            char where[64];
+            CrashDiag::describeCrumb(CrashDiag::core1Crumb(), where, sizeof(where),
+                [](uint8_t i) -> const char* {
+                    ModuleBase* m = registry().at(i);
+                    return m ? m->name() : nullptr;
+                });
+            traceSerial.printf("[%lu] CORE1 STALL: no sign of life for %lu ms, at: %s — %s\r\n",
+                               (unsigned long)now, (unsigned long)age, where,
+                               wasOn ? "TRACK POWER OFF" : "track power was already off");
+            traceLog().notef("[%lu] CORE1 STALL: %lu ms, at: %s", (unsigned long)now,
+                             (unsigned long)age, where);
+        }
+    } else if (sTripped) {
+        sTripped = false;
+        traceSerial.printf("[%lu] CORE1 STALL over: core1 running again (stalled > %lu ms); track power stays off\r\n",
+                           (unsigned long)now, (unsigned long)sTripAge);
+        traceLog().notef("[%lu] CORE1 STALL over", (unsigned long)now);
+    }
+}
+
 void loop() {
     if (gResetRequested) {
         // Stop feeding the watchdog — it will trigger a reset after 8 seconds
         // (or sooner if watchdog_enable was called elsewhere with a shorter timeout)
+        CrashDiag::setFlag(CrashDiag::F_RESET_REQUESTED);
         traceSerial.println("RESET: executed...\r\n");
         Serial2.flush();
         while(true) tight_loop_contents();
@@ -491,9 +602,17 @@ void loop() {
     // (not left at its 0 default) right before watchdog_enable() was
     // called — see that assignment's own comment for why that matters
     // here.
-    if (millis() - gCore1LastAliveMs < 4000) {
+    CrashDiag::crumb(0, CrashDiag::ST_LOOP_TOP);
+    CrashDiag::setUptime(millis());
+    // Signed difference: core1 may have written a timestamp 1 ms newer
+    // than this core's millis() read (see _checkCore1Stall()). Unsigned,
+    // that wrapped to ~4e9 and skipped one feed — harmless with an 8s
+    // timeout, but wrong.
+    if ((int32_t)(millis() - gCore1LastAliveMs) < 4000) {
         watchdog_update();  // prevent a watchdog reset
     }
+    _checkCore1Stall();
+    CrashDiag::crumb(0, CrashDiag::ST_LEDS);
     gLeds.loop();
     // NOTE: CommandBus::instance().poll() is called inside
     // registry().loopCore0() — do NOT also call it here. Calling poll()
@@ -600,11 +719,26 @@ void setup1() {
     }
     traceSerial.println(Ethernet.localIP());
 
+    // W5500 TCP retransmission: give up on a peer that does not ACK
+    // after ~1.4s instead of the chip default ~100s (200ms doubling,
+    // 8 retries). With the default, a PC that went to sleep kept core1
+    // waiting inside a send for far longer than the core1-stall limit
+    // (Oct 2026: board reset by the watchdog). 200ms x (1+2+4) = 1.4s;
+    // a peer on the LAN that is alive ACKs in well under a millisecond.
+    // The W5500 then closes the socket and the protocol module tears
+    // the client down. Ethernet library API, not a library patch.
+    Ethernet.setRetransmissionTimeout(200);
+    Ethernet.setRetransmissionCount(2);
+
     if (Ethernet.localIP() != IPAddress(0,0,0,0)) {
         const char* hostname = eepromStore().getString("net.hostname", "tmc-centrale");
         if (hostname == nullptr || strlen(hostname) == 0) hostname = "tmc-centrale";
         EthernetBonjour.begin(hostname);
-        EthernetBonjour.addServiceRecord("TMC Centrale._z21", 21105, MDNSServiceUDP);
+        // Advertise the Z21 service only when Z21 is actually running.
+        if (eepromStore().getBool("z21.enable", true))
+            EthernetBonjour.addServiceRecord("TMC Centrale._z21",
+                                             eepromStore().getUint16("z21.port", 21105),
+                                             MDNSServiceUDP);
         traceSerial.print("mDNS: "); traceSerial.print(hostname); traceSerial.println(".local \r\n");
     } else {
         traceSerial.println("mDNS: no valid IP, skipped\r\n");
@@ -638,9 +772,13 @@ void setup1() {
 //     Ethernet.maintain() when DHCP is in use.
 // ─────────────────────────────────────────────────────────────
 void loop1() {
+    CrashDiag::crumb(1, CrashDiag::ST_EVENTBUS);
     EventBus::instance().poll();  // process core0 → core1 events
+    CrashDiag::crumb(1, CrashDiag::ST_BONJOUR);
     EthernetBonjour.run();
     registry().loopCore1();
+    CrashDiag::crumb(1, CrashDiag::ST_LOOP_END);
+    gCore1Running = true;   // arms core0's stall check (_checkCore1Stall)
 
     // Updated only once the whole iteration above has genuinely
     // completed — not at the top of loop1() — so a hang inside any of
@@ -707,6 +845,9 @@ void _registerDefaultParams() {
     // home layout; the separately-tested TMC layout needs this off.
     // See DccHal::setAccessory()'s own comment in dcc_hal.cpp.
     store.registerBool("sys.turnout_invert", true, ModuleId::DCC_HAL);
+    // Core0 cuts track power when core1 (all networking) shows no sign
+    // of life for this long — see _checkCore1Stall(). 0 = off.
+    store.registerUint16("sys.core1_stall_ms", 2000, ModuleId::DCC_HAL);
     // Voltage threshold (mV) — an analogRead()-derived reading below
     // this is considered a short circuit. Replaced an earlier, purely
     // digital (digitalRead()) threshold entirely: the fault voltage
@@ -728,48 +869,12 @@ void _registerDefaultParams() {
     // during which the E-line reads continuously low (was tripping a
     // false short-circuit on every power-on).
     store.registerUint16("sys.cde_grace_ms", 300, ModuleId::DCC_HAL);
-    // v2 hardware: H-bridge nFAULT escalation policy — an isolated
-    // fault blip is expected/harmless (the DRV887x chips' own
-    // automatic-retry already handles it), only repeated faults within
-    // this window actually cut track power. See
-    // HBridgeFault::shouldEscalate() in hbridge_fault.h.
-    //
-    // Configured PER BRIDGE (dcc/sm/cde) rather than one shared set —
-    // requested by Rob so e.g. the CDE bridge (a different chip
-    // variant, DRV8876 vs the DCC bridge's DRV8874 — see the "ACK
-    // threshold" web panel's own per-bridge fields, same reasoning)
-    // can be tuned independently if its retry timing differs. Same
-    // defaults as the previous shared "sys.fault_*" keys for all
-    // three, so behaviour is unchanged until Rob tunes one bridge
-    // individually.
-    for (const char* p : { "dcc", "sm", "cde" }) {
-        char key[24];
-        snprintf(key, sizeof(key), "%s.fault_window_ms", p);
-        store.registerUint32(key, 1000, ModuleId::DCC_HAL);
-        snprintf(key, sizeof(key), "%s.fault_retry_count", p);
-        store.registerUint8 (key, 3,    ModuleId::DCC_HAL);
-        // Second, independent signal alongside the two above — see
-        // HBridgeFault::checkDuration()'s comment in hbridge_fault.h
-        // for why this is needed (a genuinely persistent fault doesn't
-        // always accumulate enough debounced edges to trip the
-        // count/window check above, under automatic-retry). May need
-        // empirical tuning (LSA/scope) against this board's actual
-        // DRV887x retry timing, per bridge.
-        snprintf(key, sizeof(key), "%s.fault_duration_ms", p);
-        store.registerUint32(key, 50,   ModuleId::DCC_HAL);
-        // Recovery-confirm debounce for checkDuration() above — see
-        // that function's own comment in hbridge_fault.h.
-        snprintf(key, sizeof(key), "%s.fault_clear_ms", p);
-        store.registerUint32(key, 10,   ModuleId::DCC_HAL);
-        // Edge debounce: consecutive LOW loop() samples before a low
-        // counts as a fault edge — see HBridgeFault::check()'s comment.
-        // Samples, not time. Default 3 = the value that used to be
-        // hardcoded.
-        snprintf(key, sizeof(key), "%s.fault_debounce", p);
-        store.registerUint16(key, 3,    ModuleId::DCC_HAL);
-    }
     store.registerString("net.subnet",   "255.255.255.0",      16, 0);
     store.registerBool  ("net.dhcp",     true,                     0);
+    // Protocol on/off — applied at boot only (restart to change). A
+    // disabled protocol opens no W5500 socket at all (the chip has
+    // only 8). Web interface and mDNS are basic networking and always on.
+    store.registerBool  ("lenz.enable",  true,  ModuleId::LENZ_LAN);
     store.registerUint16("lenz.port",    5550,  ModuleId::LENZ_LAN);
     store.registerUint8 ("lenz.maxconn", 8,     ModuleId::LENZ_LAN);
     // Client inactivity timeout (seconds) — see LENZ_LAN_TIMEOUT_DEFAULT_MS
@@ -777,6 +882,16 @@ void _registerDefaultParams() {
     // repeatedly disconnecting while idle, needing a longer margin
     // than the previous fixed 30s).
     store.registerUint16("xn.lan_timeout_s", 60, ModuleId::LENZ_LAN);
+    // What to do when a LenzLAN client (Rocrail) disappears without
+    // closing its connection — see LenzLan::_onClientLost().
+    static const char* const kLanLostOpts[] = {
+        "Do nothing",
+        "Emergency stop of locos driven via LenzLAN (default)",
+        "Track power off",
+        nullptr
+    };
+    store.registerEnum("xn.lan_lost_action", ModuleId::LENZ_LAN, 1, kLanLostOpts);
+    store.registerBool  ("z21.enable",   true,  ModuleId::Z21_LAN);   // boot only, see lenz.enable
     store.registerUint16("z21.port",     21105, ModuleId::Z21_LAN);
     // Client inactivity timeout (seconds) — see Z21_CLIENT_TIMEOUT_DEFAULT_MS
     // in z21_lan.h for why 60s specifically (the official Z21 LAN
@@ -832,6 +947,9 @@ void _registerDefaultParams() {
     store.registerEnum("dcc.swschema", ModuleId::DCC_HAL, 0, kSwitchSchemaOpts);
     store.registerEnum("dcc.swformat", ModuleId::DCC_HAL, 0, kSwitchFormatOpts);
     store.registerBool ("xn.sw_broadcast", true, ModuleId::LENZ_LAN); // 0x42 broadcast after a turnout command
+    // RS-485: answer a 0x52 turnout command with the same command
+    // (Roco/Z21 behaviour, needed by the MultiMaus turnout icon).
+    store.registerBool("xn.rs485_sw_echo", true, ModuleId::XPRESSNET_RS485);
     // XpressNet command station identification
     static const char* const kXnVersionOpts[] = {
         "v3.2 (LZV100)", "v3.6 (LZV100)", "v4.0 (TMC)", nullptr
@@ -878,33 +996,63 @@ void _registerDefaultParams() {
     // full rationale. Default false: keep the last-known state,
     // matching this project's original (pre-configurable) behaviour.
     store.registerBool  ("rsbus.clear_on_power", false, ModuleId::RS_BUS_HAL);
-    // Inrush-protection thresholds (DCC/SM bridges only) — see
-    // DccHal::_updateInrush()'s own comment for the full algorithm.
-    // Rob's own rough starting estimates — explicitly flagged as
-    // needing empirical, on-the-bench tuning, not calibrated values.
-    store.registerUint32("dcc.inrush_burst_ms",   2,    ModuleId::DCC_HAL);
-    store.registerUint16("dcc.inrush_max_bursts", 10,   ModuleId::DCC_HAL);
-    store.registerUint16("dcc.inrush_short_mv",   2500, ModuleId::DCC_HAL);
-    store.registerUint32("dcc.inrush_short_ms",   20,   ModuleId::DCC_HAL);
-    // Minimum SENSE reading (at fault-onset) for a fault to even be
-    // considered inrush — see _updateInrush()'s own comment on why
-    // (DRV8874/DRV8876 nFAULT is shared by UVLO/CPUV/OCP/TSD, and only
-    // OCP involves real current — a near-zero reading at a fault is
-    // almost certainly one of the other three, not inrush).
-    store.registerUint16("dcc.inrush_min_mv",     50,   ModuleId::DCC_HAL);
-    // What to do about a fault with sense below the minimum above (i.e.
-    // suspected UVLO/CPUV/TSD rather than overcurrent) — see
-    // DccHal::_updateInrush(). Mode 1 (fault storm only) is the
-    // default; cnt/ms define the storm; burst_ms/max are the timing
-    // used by an attempt started this way (defaults = the normal ones,
-    // untuned — an experiment, per Rob).
-    static const char* const kInrushLoOpts[] = {
-        "No - plain fault handling", "Only during a fault storm", "Yes - on every such fault", nullptr };
-    store.registerEnum  ("dcc.inrush_lo_mode",     ModuleId::DCC_HAL, 1, kInrushLoOpts);
-    store.registerUint8 ("dcc.inrush_lo_cnt",      5,    ModuleId::DCC_HAL);
-    store.registerUint32("dcc.inrush_lo_ms",       100,  ModuleId::DCC_HAL);
-    store.registerUint32("dcc.inrush_lo_burst_ms", 2,    ModuleId::DCC_HAL);
-    store.registerUint16("dcc.inrush_lo_max",      10,   ModuleId::DCC_HAL);
+    // nFAULT guard — one state machine per H-bridge, see
+    // hbridge_guard.h. Replaced ~37 settings spread over four
+    // mechanisms (retry count/window, continuous low, inrush bursts
+    // and SENSE gates, duty cycle, power). The defaults are the
+    // hardware designer's own values (nFault.md and its state diagram):
+    //   ignore  — after the first nFAULT, ignore edges this long
+    //   watch   — then watch this long; no new nFAULT = micro short
+    //   inrush  — total time from enterInrushMode() to leaving it
+    //             (the pattern only appears once the packet in flight
+    //             is done, ~13ms, and needs >=20ms on the track)
+    //   verify  — normal DCC again; any nFAULT in this time = SHORT
+    //   meas    — inrush SENSE curve window (measured and logged only)
+    store.registerUint32("nf.ignore_us",   1500, ModuleId::DCC_HAL);
+    store.registerUint32("nf.watch_ms",    20,   ModuleId::DCC_HAL);
+    store.registerUint32("nf.inrush_ms",   35,   ModuleId::DCC_HAL);
+    store.registerUint32("nf.verify_ms",   5,    ModuleId::DCC_HAL);
+    // Edges inside VERIFY that make a SHORT. 1 = the designer's rule (any
+    // single nFAULT). 2 tolerates one stray edge — a healthy loco showed
+    // false shorts from a lone micro short landing in the 5ms window
+    // (see hbridge_guard.h). Test with 2, then settle it with the designer.
+    store.registerUint8 ("nf.verify_edges", 1,   ModuleId::DCC_HAL);
+    // Skip the inrush for an isolated PAIR of single nFAULT edges while the
+    // layout is running (see hbridge_guard.h, Params::skipOther). 0 = the
+    // designer's rule. The other three only matter when it is 1.
+    store.registerUint8 ("nf.skip_other",    0,    ModuleId::DCC_HAL);
+    // Inrush for ITRIP-class faults while running (see Params::skipItrip).
+    // 1 = designer's rule (default), 0 = no inrush for ITRIP bursts, except
+    // at power-on and when the chain lasts longer than nf.itrip_max_ms.
+    store.registerUint8 ("nf.inrush_itrip",  1,    ModuleId::DCC_HAL);
+    store.registerUint32("nf.itrip_max_ms",  50,   ModuleId::DCC_HAL);
+    store.registerUint8 ("nf.burst_n",       4,    ModuleId::DCC_HAL);
+    store.registerUint32("nf.pon_grace_ms",  3000, ModuleId::DCC_HAL);
+    store.registerUint32("nf.burst_ms",      250,  ModuleId::DCC_HAL);
+    store.registerUint32("nf.meas_us",     2000, ModuleId::DCC_HAL);
+    // After a SHORT: wait, then switch the track on again, at most
+    // restart_max times (0 = never automatically). A manual power-on
+    // starts the count over.
+    store.registerUint32("nf.restart_ms",  1000, ModuleId::DCC_HAL);
+    store.registerUint8 ("nf.restart_max", 3,    ModuleId::DCC_HAL);
+    // Power estimate (I^2 x RDS(on), time-averaged), DCC and SM only.
+    // sense_mv_a = SENSE millivolts per ampere = AIPROPI x R_IPROPI:
+    //   DCC (DRV8874, 450uA/A)  with 2.49k || (1k + 1k) = 1.109k -> ~499
+    //   SM  (DRV8876, 1000uA/A) with only the module's 2.49k     -> ~2490
+    // CHECK THESE AGAINST WHAT IS ACTUALLY FITTED — they are a
+    // calculation from the datasheet, not a measurement.
+    // rds_mohm: DRV8874 200 mOhm, DRV8876 700 mOhm (HS+LS).
+    // pwr_mw: trip level. The designer writes both "~3A" (1.8W in a
+    // DRV8874) and "2.5-3W" for the same limit; 2500 is a starting
+    // value to settle with him. pwr_shift: time constant, 2^n ms.
+    store.registerUint32("dcc.sense_mv_a", 499,  ModuleId::DCC_HAL);
+    store.registerUint32("dcc.rds_mohm",   200,  ModuleId::DCC_HAL);
+    store.registerUint32("dcc.pwr_mw",     2500, ModuleId::DCC_HAL);
+    store.registerUint8 ("dcc.pwr_shift",  7,    ModuleId::DCC_HAL);
+    store.registerUint32("sm.sense_mv_a",  2490, ModuleId::DCC_HAL);
+    store.registerUint32("sm.rds_mohm",    700,  ModuleId::DCC_HAL);
+    store.registerUint32("sm.pwr_mw",      2500, ModuleId::DCC_HAL);
+    store.registerUint8 ("sm.pwr_shift",   7,    ModuleId::DCC_HAL);
     // USB (LenzUsb, native USB CDC — XpressNet-over-USB, e.g. for
     // Rocrail) and debug/trace UART (Serial2) serial port settings —
     // see LenzUsb::begin(), setup()'s own comments, and
@@ -936,6 +1084,12 @@ void _registerDefaultParams() {
     // protocol server). See trace_log.h for the full design.
     store.registerBool  ("debug.tcp_log_enable", false, ModuleId::TRACE_LOG);
     store.registerUint16("debug.tcp_log_port", TRACE_LOG_PORT_DEFAULT, ModuleId::TRACE_LOG);
+    // Where the trace goes: LAN (TCP viewer), the serial debug port
+    // (Serial2, "dbg.baud"), or both. Serial only = no TCP socket.
+    static const char* const kLogOutputOpts[] = {
+        "LAN (TCP viewer)", "Serial debug port", "Both", nullptr
+    };
+    store.registerEnum("debug.log_output", ModuleId::TRACE_LOG, 0, kLogOutputOpts);
     // Minimum level to show — TraceLevel enum (trace_log.h): 0=DEBUG,
     // 1=INFO, 2=WARNING, 3=ERROR. Default INFO, so DEBUG-level detail
     // is opt-in.

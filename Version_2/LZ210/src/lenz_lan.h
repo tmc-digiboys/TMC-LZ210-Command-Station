@@ -48,6 +48,9 @@
 // measuring Rocrail's actual idle interval directly via TraceLog's
 // existing "XN-LAN RX" logging.
 #define LENZ_LAN_TIMEOUT_DEFAULT_MS 60000
+// A client whose TX buffer has had no room for this long is considered
+// dead (peer frozen / asleep with a zero receive window) and closed.
+#define LENZ_LAN_TX_STALL_MS  5000
 #define LENZ_LAN_PROG_TIMEOUT 90000   // Timeout in programming mode (90s)
 #define LENZ_LAN_FRAME_TIMEOUT_MS 250 // Max time allowed for an incomplete frame (spec: "01/01/00")
 
@@ -70,6 +73,8 @@ struct LenzClient {
     uint32_t       lastActMs;               // Timestamp of last activity (millis)
     uint32_t       frameStartMs;            // Timestamp at which the current incomplete frame started (0 = none)
     bool           active;                   // True if this slot is in use
+    uint32_t       txStuckSinceMs;          // 0 = sending fine; else when the TX buffer first had no room
+    uint32_t       txDropped;               // frames dropped because the TX buffer was full
 
     LenzClient() : port(0), rxLen(0), progMode(false), lastActMs(0), frameStartMs(0), active(false) {}
 };
@@ -185,6 +190,20 @@ private:
     // go through this function, so the flush behaviour is defined in
     // exactly one place.
     void _sendRaw(LenzClient& c, const uint8_t* buf, uint8_t len);
+    // Close a client slot without blocking (see _sendRaw()).
+    void _dropClient(LenzClient& c, const char* why);
+    // A client vanished without closing its connection (lifecheck
+    // missed, peer not answering, TX stalled): apply "xn.lan_lost_action".
+    void _onClientLost(const LenzClient& c, const char* why);
+    uint32_t _lostCount = 0;
+    uint32_t _lastLostMs = 0;
+    char     _lastLostWhy[32] = "";
+public:
+    // For the web page: unexpected client losses since boot.
+    uint32_t    lostCount()  const { return _lostCount; }
+    uint32_t    lastLostMs() const { return _lastLostMs; }
+    const char* lastLostWhy() const { return _lastLostWhy; }
+private:
 
     // Sends an XpressNet frame to a single client with LAN header
     void _sendFrame(LenzClient& c, const XnFrame& f);

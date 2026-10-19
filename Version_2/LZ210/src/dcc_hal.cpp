@@ -10,8 +10,8 @@
 //  - Loco speed and function updates (via dirty-poll of LocoRepository)
 //  - Turnout (accessory decoder) commands
 //  - CV read/write on the programming track and via POM
-//  - Short circuit (HBridgeFault) and ACK (DccCurrentMonitor) detection
-//    on the three onboard v2 H-bridges — see hbridge_fault.h and
+//  - Short circuit (NFaultSource + HBridgeGuard) and ACK (DccCurrentMonitor)
+//    detection on the three onboard v2 H-bridges — see hbridge_guard.h and
 //    dcc_current_monitor.h
 //
 //  Turnout addressing is configured via the web interface:
@@ -209,237 +209,35 @@ void DccHal::_checkCdeShort() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  _updateInrush() — inrush-protection state machine for whichever of
-//  DCC/SM is currently the ACTIVE output (they share the one PIO/DMA
-//  DCC signal generator — dccPacketEngine — so only one is ever really
-//  driving anything: SM during a service-mode session, DCC main
-//  otherwise). CDE is intentionally NOT covered here (Rob: only DCC
-//  and SM talk directly to a loco's own decoder — a fresh rail
-//  contact's input-capacitor inrush, or a motor's back-EMF kickback as
-//  it stops, both confirmed by Rob to trip nFAULT harmlessly — CDE
-//  doesn't see that kind of transient the same way).
+//  nFAULT guards — the DccHal side of HBridgeGuard
 //
-//  On a fresh fault edge on the active bridge, instead of treating it
-//  as an immediate fault (the plain edge-count/duration checks just
-//  below in loop() still do that, as an independent backstop), this
-//  switches dccPacketEngine into "inrush mode": a train of short
-//  (~2.5us) pulses too brief to trip the DRV887x's own OCP comparator,
-//  letting a decoder's input capacitor charge gradually instead of
-//  drawing one large, sustained inrush current. See DCCHardware_RP.inc
-//  (DCCInterfaceMaster-TMC library, Aiko Pras) for the actual waveform
-//  — this class only decides WHEN to start/stop it and for how long.
+//  The state machine itself (NORMAL / IGNORE / WATCH / INRUSH / VERIFY
+//  / SHORT, from the hardware designer's diagram) lives in
+//  hbridge_guard.h and decides purely on interrupt-timed edge
+//  timestamps. This is what it needs from DccHal: the inrush pattern
+//  on/off, ONE place that cuts the power, and the parameters.
 //
-//  Distinguishing genuine inrush from a genuine short (both trip
-//  nFAULT the same way) per Rob's own description: inrush current
-//  DECAYS as the capacitor charges, while a real short's current stays
-//  roughly constant. So two independent checks run while inrush mode
-//  is active:
-//   - Periodically (every "dcc.inrush_burst_ms"), check whether
-//     nFAULT has actually cleared yet. If not, and the configurable
-//     "dcc.inrush_max_bursts" budget of periods is used up without it
-//     clearing, give up and treat it as a genuine short.
-//   - Continuously, watch the SENSE reading: if it stays at or above
-//     "dcc.inrush_short_mv" for at least "dcc.inrush_short_ms", that's
-//     read as "not decaying" — a real short — and ends the attempt
-//     immediately rather than waiting out the remaining burst budget.
-//  Either path calls _checkHBridgeFault() directly once it concludes
-//  this is a genuine short (station-wide power-off, the same response
-//  as any other escalated nFAULT).
-//
-//  All four thresholds are EEPROM-configurable (web interface, System
-//  panel) — deliberately NOT per-bridge (unlike the fault-escalation
-//  thresholds elsewhere in this file): both DCC and SM drive the same
-//  kind of decoder-equipped loco, so the same inrush characteristics
-//  should apply to either. The defaults below are Rob's own rough
-//  starting estimates, explicitly flagged (his own words) as needing
-//  empirical, on-the-bench tuning against this hardware's actual
-//  behaviour — treat them as placeholders, not calibrated values.
+//  This replaced _updateInrush(), _checkHBridgeFault() and the
+//  shouldEscalate/checkDuration/duty-cycle/power paths that had grown
+//  around them: seven independent routes to a power-off, ~37 settings.
 // ─────────────────────────────────────────────────────────────
-void DccHal::_updateInrush(bool dccEdge, bool smEdge) {
-    if (!_power) {
-        // Track power went off (e.g. this same escalation calling
-        // _checkHBridgeFault() a moment ago) while an attempt was still
-        // running — clean up immediately rather than leaving it dangling
-        // until the next power-on, which was resuming a stale attempt
-        // with a misleading elapsed time (confirmed, Rob: TraceLog
-        // showed "RESOLVED after 55468ms" — the 55s was just how long
-        // track power happened to stay off, not anything about the
-        // actual inrush).
-        if (_inrushBridge != nullptr) {
-            dccPacketEngine.leaveInrushMode();
-            _inrushBridge = nullptr;
-        }
-        return;
-    }
 
-    HBridgeFault&            active      = _serviceModeRequested ? _faultSm  : _faultDcc;
-    const DccCurrentMonitor& activeSense = _serviceModeRequested ? _senseSm  : _senseDcc;
-    bool                     activeEdge  = _serviceModeRequested ? smEdge    : dccEdge;
-
-    uint32_t burstMs   = eepromStore().getUint32("dcc.inrush_burst_ms",   2);
-    uint16_t maxBursts = eepromStore().getUint16("dcc.inrush_max_bursts", 10);
-    uint16_t shortMv   = eepromStore().getUint16("dcc.inrush_short_mv",   2500);
-    uint32_t shortMs   = eepromStore().getUint32("dcc.inrush_short_ms",   20);
-
-    // Idle: a fresh edge on the active bridge starts a new attempt —
-    // but only if SENSE at fault-onset actually indicates real current
-    // flowing. Per the DRV8874/DRV8876 datasheet, nFAULT is a single
-    // shared flag for FOUR distinct conditions: UVLO, CPUV, OCP, and
-    // TSD — and for three of those four (everything except OCP), the
-    // outputs are simply disabled, meaning no current flows at all.
-    // A fault with a near-zero SENSE reading is therefore almost
-    // certainly one of those three, NOT an overcurrent/inrush
-    // situation — confirmed, Rob: locos that wouldn't drive were
-    // showing repeated nFAULTs with SENSE around 4-5mV, and the
-    // inrush pulse train (which only ever helps a genuine current
-    // event) was uselessly retrying against something it can never
-    // resolve. Below "dcc.inrush_min_mv", skip inrush entirely and
-    // fall straight through to the plain shouldEscalate()/
-    // checkDuration() safety net below (unchanged from before this
-    // whole feature existed) — _inrushBridge stays nullptr, so those
-    // checks are not skipped for this edge.
-    if (_inrushBridge == nullptr) {
-        if (!activeEdge) return;
-        uint16_t minMv   = eepromStore().getUint16("dcc.inrush_min_mv", 50);
-        uint16_t senseMv = activeSense.lastMv();
-        bool     lowSense = senseMv < minMv;
-        if (lowSense) {
-            // What to do about a fault that looks like UVLO/CPUV/TSD
-            // rather than overcurrent (Rob wanted this configurable —
-            // the pulses are only KNOWN to help against a current
-            // event, so trying them here is an experiment):
-            //   0 = Skip — plain escalation checks only (the original
-            //       behaviour of this gate)
-            //   1 = Only during a fault storm — inrush is tried once
-            //       dcc.inrush_lo_cnt faults land within
-            //       dcc.inrush_lo_ms (HBridgeFault's own edge history;
-            //       this edge was already recorded by check())
-            //   2 = Always — every such fault gets an inrush attempt
-            // An attempt started here also uses its OWN timing
-            // (dcc.inrush_lo_burst_ms / dcc.inrush_lo_max, see below):
-            // a chip recovering from undervoltage or thermal shutdown
-            // has no reason to behave like an overcurrent retry.
-            uint8_t loMode = eepromStore().getUint8("dcc.inrush_lo_mode", 1);
-            bool    try_   = false;
-            uint8_t  loCnt = eepromStore().getUint8 ("dcc.inrush_lo_cnt", 5);
-            uint32_t loMs  = eepromStore().getUint32("dcc.inrush_lo_ms",  100);
-            if (loMode == 2)      try_ = true;
-            else if (loMode == 1) try_ = active.stormWithin(loMs, loCnt);
-            if (!try_) {
-                traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
-                                 "%s fault sense=%umV < %umV, not inrush (UVLO/CPUV/TSD?) — skipping inrush",
-                                 active.name(), senseMv, minMv);
-                return;
-            }
-            if (loMode == 1)
-                traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
-                                 "%s fault sense=%umV < %umV but >=%u faults within %lums — trying inrush anyway",
-                                 active.name(), senseMv, minMv, loCnt, loMs);
-        }
-        _inrushBridge       = &active;
-        _inrushLowSense     = lowSense;
-        _inrushStartMs      = millis();
-        _inrushBurstStartMs = _inrushStartMs;
-        _inrushBurstCount   = 0;
-        _inrushShortSinceMs = 0;
-        active.resetDuration();  // clear any contamination from a gap sample before this attempt — see resetDuration()'s own comment
-        dccPacketEngine.enterInrushMode();
-        traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
-                         "%s inrush mode ENTER%s, sense=%umV",
-                         active.name(), lowSense ? " (low-sense)" : "", senseMv);
-        return;
-    }
-
-    // The active bridge changed mid-attempt (e.g. a service-mode
-    // session started or ended) — abandon cleanly rather than keep
-    // running an attempt against a bridge we're no longer tracking.
-    if (_inrushBridge != &active) {
-        dccPacketEngine.leaveInrushMode();
-        _inrushBridge = nullptr;
-        return;
-    }
-
-    // An attempt that was started for a suspected UVLO/CPUV/TSD fault
-    // (low sense) uses its own period/budget, not the overcurrent ones.
-    if (_inrushLowSense) {
-        burstMs   = eepromStore().getUint32("dcc.inrush_lo_burst_ms", 2);
-        maxBursts = eepromStore().getUint16("dcc.inrush_lo_max",      10);
-    }
-
-    // Sustained-short check — every loop() iteration, independent of
-    // the periodic burst check below.
-    uint16_t mv = activeSense.lastMv();
-    if (mv >= shortMv) {
-        if (_inrushShortSinceMs == 0) {
-            _inrushShortSinceMs = millis();
-        } else if (millis() - _inrushShortSinceMs >= shortMs) {
-            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE,
-                             "%s inrush -> SHORT (sense %umV >= %umV for >=%lums)",
-                             active.name(), mv, shortMv, shortMs);
-            dccPacketEngine.leaveInrushMode();
-            _inrushBridge = nullptr;
-            _checkHBridgeFault(active);
-            return;
-        }
-    } else {
-        _inrushShortSinceMs = 0;  // back below threshold — sustained timer resets
-    }
-
-    // Periodic burst check: has nFAULT actually cleared yet?
-    if (millis() - _inrushBurstStartMs < burstMs) return;  // still within this period
-    _inrushBurstStartMs = millis();
-    _inrushBurstCount++;
-
-    // Logged every period, not just on resolve/give-up — added (Rob:
-    // wanted to see the actual sense trend across periods, to judge
-    // whether "dcc.inrush_short_mv" is set too low, since a genuine
-    // inrush is expected to show a DECREASING sequence of these values
-    // while a real short would stay roughly flat).
-    traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
-                     "%s inrush period %u: sense=%umV, faulted=%d",
-                     active.name(), _inrushBurstCount, mv, active.isFaulted());
-
-    if (!active.isFaulted()) {
-        traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE,
-                         "%s inrush RESOLVED after %lums (%u periods), sense=%umV",
-                         active.name(), millis() - _inrushStartMs, _inrushBurstCount, mv);
-        active.resetDuration();  // clean baseline for the next independent checkDuration() call — see its own comment
-        dccPacketEngine.leaveInrushMode();
-        _inrushBridge = nullptr;
-        return;
-    }
-
-    if (_inrushBurstCount >= maxBursts) {
-        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE,
-                         "%s inrush GIVE UP after %u periods, still faulted -> SHORT",
-                         active.name(), _inrushBurstCount);
-        dccPacketEngine.leaveInrushMode();
-        _inrushBridge = nullptr;
-        _checkHBridgeFault(active);
-    }
-    // else: budget remains — stay in inrush mode, next period will check again.
+void DccHal::_guardEnterInrush(void*) { dccPacketEngine.enterInrushMode(); }
+void DccHal::_guardLeaveInrush(void*) { dccPacketEngine.leaveInrushMode(); }
+void DccHal::_guardShort(void* ctx, const char* why) {
+    if (_instance) _instance->_onGuardShort((uint8_t)(uintptr_t)ctx, why);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  _checkHBridgeFault() — v2 hardware H-bridge nFAULT response
-//
-//  Called once per bridge from loop(), only when that bridge's
-//  HBridgeFault::check() just reported a new fault edge (see
-//  hbridge_fault.h). Unlike the CDE E-signal check above (which has
-//  a configurable "let the booster handle it locally" mode via
-//  sys.cde_mode), a genuine nFAULT from the bridge's own silicon
-//  (overcurrent, overtemperature, or supply/charge-pump undervoltage
-//  — see hbridge_fault.h) is always treated as serious: there is no
-//  "log only" option here. Logs which bridge faulted, updates
-//  gCentrale's bookkeeping, dispatches POWER_OFF the normal way (so
-//  protocol modules inform their clients), turns off track power
-//  directly, and lights the short-circuit status LED.
-// ─────────────────────────────────────────────────────────────
-void DccHal::_checkHBridgeFault(HBridgeFault& fb) {
-    if (!_power) return;  // already off, nothing to do
+// The one place a bridge fault powers the station off. Same response
+// as before (bookkeeping, POWER_OFF dispatched so protocol modules
+// inform their clients, track power off, short-circuit LED) — plus
+// scheduling the automatic restart.
+void DccHal::_onGuardShort(uint8_t bridge, const char* why) {
+    if (!_power) return;  // already off
+    static const char* const names[3] = { "DCC", "SM", "CDE" };
 
-    traceSerial.printf("[%lu] H-brug fault (%s) detected — power off\n",
-                   millis(), fb.name());
+    traceSerial.printf("[%lu] H-brug fault (%s) detected — power off (%s)\n",
+                       millis(), names[bridge < 3 ? bridge : 0], why);
     gCentrale.trackPowerOff = true;
     gCentrale.emergencyStop = false;
     gCentrale.shortCircuit  = true;
@@ -448,8 +246,155 @@ void DccHal::_checkHBridgeFault(HBridgeFault& fb) {
     cmd.type     = CmdType::POWER_OFF;
     cmd.sourceId = ModuleId::DCC_HAL;
     CommandBus::instance().dispatch(cmd);
-    setPower(false);
+    setPower(false);          // also cancels any pending restart...
     gLeds.onShortCircuit();
+
+    // ...so it is re-armed here, after, if attempts are left.
+    // nf.restart_max = 0 disables automatic restart entirely.
+    uint8_t  maxRestarts = eepromStore().getUint8 ("nf.restart_max", 3);
+    uint32_t restartMs   = eepromStore().getUint32("nf.restart_ms",  1000);
+    if (_restartCount < maxRestarts) {
+        _restartPending = true;
+        _restartAtMs    = millis() + restartMs;
+    } else if (maxRestarts > 0) {
+        traceSerial.printf("[%lu] nFAULT guard: %u automatic restart(s) used up — power stays off\n",
+                           millis(), (unsigned)_restartCount);
+    }
+}
+
+// The designer's "wait 1s, then restart". Does what a manual power-on
+// does to the command-station flags, then switches the track on; the
+// protocol modules hear about it through the same railpower event as
+// for any other power-on.
+void DccHal::_autoRestart() {
+    _restartPending = false;
+    _restartCount++;
+    _lastRestartMs  = millis();
+    traceSerial.printf("[%lu] nFAULT guard: automatic restart %u\n",
+                       millis(), (unsigned)_restartCount);
+    gCentrale.emergencyStop = false;
+    gCentrale.trackPowerOff = false;
+    gCentrale.shortCircuit  = false;
+
+    // Tell the protocol modules, the same way _onGuardShort() does for
+    // the power-off. Found in a TraceLog (Rob): after an automatic
+    // restart the LocoNet module never logged its usual "LNET RX/TX:
+    // 83 7C", because it is driven by CommandBus commands (POWER_ON
+    // sends OPC_GPON and sets TRK_POWER_ON in the slot server — see
+    // loconet_module.cpp), NOT by the railpower event that RS-Bus and
+    // XpressNet follow. With only setPower(true) here, LocoNet clients
+    // kept believing track power was off while it was on.
+    // The CommandBus skips the sender (command_bus.cpp), so DccHal does
+    // not receive this itself — no second setPower(true), and the
+    // restart count below is not reset by it.
+    Command cmd{};
+    cmd.type     = CmdType::POWER_ON;
+    cmd.sourceId = ModuleId::DCC_HAL;
+    CommandBus::instance().dispatch(cmd);
+
+    _autoRestarting = true;     // so setPower(true) does not reset the attempt count
+    setPower(true);
+    _autoRestarting = false;
+}
+
+// Guard parameters from EEPROM, a few times per second rather than on
+// every loop() pass.
+void DccHal::_refreshGuardParams() {
+    uint32_t now = millis();
+    if (_gpRefreshMs != 0 && (now - _gpRefreshMs) < 200) return;
+    _gpRefreshMs = now ? now : 1;
+
+    uint32_t ignoreUs = eepromStore().getUint32("nf.ignore_us", 1500);
+    uint32_t watchUs  = eepromStore().getUint32("nf.watch_ms",    20) * 1000UL;
+    uint32_t inrushUs = eepromStore().getUint32("nf.inrush_ms",   35) * 1000UL;
+    uint32_t verifyUs = eepromStore().getUint32("nf.verify_ms",    5) * 1000UL;
+    uint32_t measUs   = eepromStore().getUint32("nf.meas_us",   2000);
+    uint8_t  verifyEdges = eepromStore().getUint8("nf.verify_edges", 1);
+    // Optional rule (default off = designer's behaviour): see Params::skipOther.
+    uint8_t  skipOther   = eepromStore().getUint8 ("nf.skip_other",   0);
+    // Optional (default 1 = designer's rule): see Params::skipItrip.
+    uint8_t  inrushItrip = eepromStore().getUint8 ("nf.inrush_itrip", 1);
+    uint32_t itripMaxMs  = eepromStore().getUint32("nf.itrip_max_ms", 50);
+    if (itripMaxMs > 3600000UL) itripMaxMs = 3600000UL;
+    uint8_t  burstN      = eepromStore().getUint8 ("nf.burst_n",      4);
+    uint32_t ponGraceMs  = eepromStore().getUint32("nf.pon_grace_ms", 3000);
+    uint32_t burstMs     = eepromStore().getUint32("nf.burst_ms",     250);
+    if (ponGraceMs > 3600000UL) ponGraceMs = 3600000UL;   // keeps *1000 inside 32 bits
+    if (burstMs    > 3600000UL) burstMs    = 3600000UL;
+
+    HBridgeGuard::Params* all[3] = { &_gpDcc, &_gpSm, &_gpCde };
+    for (HBridgeGuard::Params* p : all) {
+        p->ignoreUs = ignoreUs;
+        p->watchUs  = watchUs;
+        p->inrushUs = inrushUs;
+        p->verifyUs = verifyUs;
+        p->measUs   = measUs;
+        p->verifyEdges = verifyEdges;
+        p->skipOther   = skipOther;
+        p->skipItrip   = inrushItrip ? 0 : 1;
+        p->itripMaxUs  = itripMaxMs * 1000UL;
+        p->burstN      = burstN;
+        p->ponGraceUs  = ponGraceMs * 1000UL;
+        p->burstUs     = burstMs * 1000UL;
+    }
+
+    // Power estimate: DCC and SM only. CDE drives a booster network,
+    // not a loco, so it has none (limitMw = 0).
+    _gpDcc.scaleMvA = eepromStore().getUint32("dcc.sense_mv_a", 499);
+    _gpDcc.rdsMohm  = eepromStore().getUint32("dcc.rds_mohm",   200);
+    _gpDcc.limitMw  = eepromStore().getUint32("dcc.pwr_mw",    2500);
+    _gpDcc.shift    = eepromStore().getUint8 ("dcc.pwr_shift",    7);
+    _gpSm.scaleMvA  = eepromStore().getUint32("sm.sense_mv_a", 2490);
+    _gpSm.rdsMohm   = eepromStore().getUint32("sm.rds_mohm",    700);
+    _gpSm.limitMw   = eepromStore().getUint32("sm.pwr_mw",     2500);
+    _gpSm.shift     = eepromStore().getUint8 ("sm.pwr_shift",     7);
+    _gpCde.limitMw  = 0;
+}
+
+// Called every loop() pass, after the SENSE monitors have read.
+void DccHal::_updateGuards() {
+    uint32_t nowUs = micros();
+
+    _srcDcc.updateDuty(nowUs);
+    _srcSm.updateDuty(nowUs);
+    _srcCde.updateDuty(nowUs);
+
+    if (!_power) {
+        // Nothing to guard. Keep the edge queues empty so nothing stale
+        // reaches the state machines at the next power-on.
+        _srcDcc.clear(); _srcSm.clear(); _srcCde.clear();
+        if (_restartPending && (int32_t)(millis() - _restartAtMs) >= 0) _autoRestart();
+        return;
+    }
+
+    // A restart that then ran 10s without incident starts the count over.
+    if (_restartCount > 0 && (millis() - _lastRestartMs) > 10000UL) _restartCount = 0;
+
+    _refreshGuardParams();
+    // Only one of DCC/SM drives the track at a time (they share the one
+    // DCC bitstream generator), so only that one can do inrush.
+    _gpDcc.inrushAllowed = !_serviceModeRequested;
+    _gpSm.inrushAllowed  =  _serviceModeRequested;
+    _gpCde.inrushAllowed = false;
+
+    // SENSE: one peak-hold sample per loop() pass.
+    _guardDcc.feedSense(_senseDcc.lastMv());
+    _guardSm.feedSense(_senseSm.lastMv());
+
+    // Any guard may cut the power; stop as soon as one has.
+    _guardDcc.update(_srcDcc, _gpDcc, nowUs);
+    if (!_power) return;
+    _guardSm.update(_srcSm, _gpSm, nowUs);
+    if (!_power) return;
+
+    // sys.cde_enable (web interface, System): no CDE booster connected
+    // means the nFAULT pin floats — the guard must not react to it.
+    if (eepromStore().getBool("sys.cde_enable", true)) {
+        _guardCde.update(_srcCde, _gpCde, nowUs);
+    } else {
+        _srcCde.clear();
+        _guardCde.reset(nowUs);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -502,8 +447,8 @@ void DccHal::_checkHBridgeFault(HBridgeFault& fb) {
 //  registers _onCommand() as this module's CommandBus handler on
 //  core0, so commands dispatched by protocol modules reach this class.
 //
-//  v2 hardware: also initialises the three HBridgeFault and three
-//  DccCurrentMonitor instances (see hbridge_fault.h/
+//  v2 hardware: also initialises the three NFaultSource/HBridgeGuard pairs
+//  and three DccCurrentMonitor instances (see nfault_source.h, hbridge_guard.h,
 //  dcc_current_monitor.h).
 // ─────────────────────────────────────────────────────────────
 void DccHal::begin() {
@@ -529,10 +474,29 @@ void DccHal::begin() {
     gpio_disable_pulls(_pinCde);
 
     // v2 hardware: the three onboard H-bridges' low-active nFAULT
-    // pins (short-circuit/overcurrent detection).
-    _faultDcc.begin();
-    _faultSm.begin();
-    _faultCde.begin();
+    // pins (short-circuit/overcurrent detection). Interrupt-driven —
+    // see nfault_source.h for why — so begin() (configures
+    // the pin) is followed by attachIsr() (starts timing edges) for
+    // each. _instance must already be set (it is — see the top of
+    // this function) since the three ISR trampolines below reach
+    // their bridge through it.
+    _srcDcc.begin();
+    _srcSm.begin();
+    _srcCde.begin();
+    _srcDcc.attachIsr(_onDccFaultChange);
+    _srcSm.attachIsr(_onSmFaultChange);
+    _srcCde.attachIsr(_onCdeFaultChange);
+
+    HBridgeGuard::Hooks hk;
+    hk.enterInrush  = DccHal::_guardEnterInrush;
+    hk.leaveInrush  = DccHal::_guardLeaveInrush;
+    hk.shortCircuit = DccHal::_guardShort;
+    hk.ctx = (void*)(uintptr_t)0;  _guardDcc.begin("DCC", hk);
+    hk.ctx = (void*)(uintptr_t)1;  _guardSm.begin("SM",   hk);
+    hk.ctx = (void*)(uintptr_t)2;  _guardCde.begin("CDE", hk);
+    _guardDcc.reset(micros());
+    _guardSm.reset(micros());
+    _guardCde.reset(micros());
 
     // v2 hardware: the three onboard H-bridges' analogue SENSE lines
     // (decoder ACK detection).
@@ -626,7 +590,7 @@ void DccHal::_applySwitchMode() {
 //  have been marked dirty in the LocoRepository.
 //
 //  v2 hardware: also checks all three H-bridges' nFAULT pins
-//  (short-circuit/overcurrent — see hbridge_fault.h) and drives all
+//  (short-circuit/overcurrent — see hbridge_guard.h) and drives all
 //  three H-bridges' ACK detection (see dcc_current_monitor.h).
 //
 //  v2 hardware: also handles the service-mode H-bridge output
@@ -672,146 +636,6 @@ void DccHal::loop() {
 
     _checkCdeShort();   // CDE booster short-circuit detection via GP05
 
-    // v2 hardware: nFAULT (short-circuit/overcurrent) on all three
-    // bridges. Every debounced fault edge is logged via TraceLog
-    // (previously this comment's own claim was aspirational, not
-    // actually true — an isolated blip that never escalated produced
-    // no log line at all, due to a short-circuiting "&&" that gated
-    // the log on shouldEscalate() too; fixed below, Rob: needed
-    // visibility into individually-harmless blips to diagnose trains
-    // repeatedly stopping/track power dropping, suspected to be too
-    // many small nFAULT events even though none was escalating on its
-    // own). Two independent signals can each trigger a station-wide
-    // power-off:
-    // repeated faults within a short window (shouldEscalate()), or
-    // nFAULT observed continuously low for at least a duration
-    // threshold (checkDuration()) — see HBridgeFault's comments for
-    // why both are needed: with IMODE=GND (fixed off-time, automatic
-    // retry, confirmed by Rob against the datasheet), a genuinely
-    // persistent fault doesn't necessarily accumulate enough debounced
-    // edges within the window to reach shouldEscalate()'s retry count
-    // (confirmed empirically — a real short stopped escalating once
-    // that check alone was in place), so checkDuration() catches it
-    // independently via raw continuous-low time instead. An isolated
-    // blip is logged but triggers neither escalation path. All
-    // thresholds are EEPROM-configurable (web interface), PER BRIDGE
-    // (dcc/sm/cde) — requested by Rob so e.g. the CDE bridge (a
-    // different chip variant, DRV8876 vs the DCC bridge's DRV8874 —
-    // same reasoning as the per-bridge ACK-threshold fields) can be
-    // tuned independently if its retry timing differs.
-    struct FaultParams { uint32_t windowMs, durationMs, clearMs; uint16_t debounce; uint8_t retryCount; };
-    auto faultParams = [](const char* prefix) {
-        char key[24];
-        FaultParams p;
-        snprintf(key, sizeof(key), "%s.fault_window_ms", prefix);
-        p.windowMs   = eepromStore().getUint32(key, 1000);
-        snprintf(key, sizeof(key), "%s.fault_retry_count", prefix);
-        p.retryCount = eepromStore().getUint8(key, 3);
-        snprintf(key, sizeof(key), "%s.fault_duration_ms", prefix);
-        p.durationMs = eepromStore().getUint32(key, 50);
-        // Recovery-confirm debounce for checkDuration() below — same
-        // reasoning as CDE_CLEAR_US (dcc_hal.h)/"sys.cde_clear_us": a
-        // storm of closely-spaced fault blips (Rob, TraceLog: a
-        // ~2-second run of individual "fault edge" events with no
-        // escalation at all) needs the pin to read genuinely HIGH for
-        // at least this long before checkDuration() treats it as
-        // recovered, rather than resetting on the very first HIGH
-        // sample caught between blips.
-        snprintf(key, sizeof(key), "%s.fault_clear_ms", prefix);
-        p.clearMs    = eepromStore().getUint32(key, 10);
-        // Edge debounce for HBridgeFault::check() — consecutive LOW
-        // loop() samples required before a low counts as a fault edge
-        // (Rob: was hardcoded to 3). Samples, not time — see check()'s
-        // own comment. Default 3 preserves the old behaviour.
-        snprintf(key, sizeof(key), "%s.fault_debounce", prefix);
-        p.debounce   = eepromStore().getUint16(key, 3);
-        return p;
-    };
-    FaultParams dccParams = faultParams("dcc");
-    FaultParams smParams  = faultParams("sm");
-    FaultParams cdeParams = faultParams("cde");
-
-    // check() must be captured once per bridge and reused as the gate
-    // for shouldEscalate() below (not called again/separately) —
-    // shouldEscalate() only looks at already-recorded history and is
-    // otherwise stateless, so without this gate it would re-evaluate
-    // true on every single loop() iteration for as long as the window/
-    // count condition holds, re-triggering _checkHBridgeFault()
-    // repeatedly instead of once at the moment a new qualifying edge
-    // occurs.
-    //
-    // Logging every individual debounced fault edge here too — a
-    // previous version only acted on (and therefore only logged) an
-    // edge if it ALSO happened to satisfy shouldEscalate() in the same
-    // call, via a short-circuiting "&&": an isolated blip that never
-    // escalated produced no log line at all, despite this section's
-    // own comment above claiming otherwise. Logged separately, before
-    // the escalation check, so a genuine pattern of frequent-but-
-    // individually-harmless blips (Rob: trains repeatedly stopping,
-    // track power going out — suspected too many small nFAULT events
-    // even though none is individually escalating) becomes visible via
-    // TraceLog, one line per H-bridge (name() distinguishes DCC/SM/CDE).
-    bool dccEdge = _faultDcc.check(dccParams.debounce);
-    bool smEdge  = _faultSm.check(smParams.debounce);
-    bool cdeEdge = _faultCde.check(cdeParams.debounce);
-    if (dccEdge) traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultDcc.name());
-    if (smEdge)  traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultSm.name());
-    if (cdeEdge) traceLog().logf(TraceLevel::INFO, TraceSource::HBRIDGE, "%s fault edge", _faultCde.name());
-
-    // Inrush protection (DCC/SM only — see _updateInrush()'s own
-    // comment) gets first crack at a fresh fault edge on whichever of
-    // the two is currently active.
-    _updateInrush(dccEdge, smEdge);
-
-    // While _updateInrush() owns an in-progress attempt for a bridge
-    // (or just started/ended one this very iteration), skip the
-    // generic edge-count/duration escalation checks for THAT bridge —
-    // confirmed, Rob (TraceLog): several individually-resolved inrush
-    // recoveries in quick succession (each cleared within ~2ms) were
-    // tripping shouldEscalate()'s retry-count check anyway, even
-    // though every one of them was already handled correctly and
-    // nothing was actually wrong. checkDuration() is skipped here too
-    // for the same reason — it isn't edge-gated, so it would otherwise
-    // keep timing "continuously low" through a normal, in-progress
-    // inrush attempt regardless. Once idle (no attempt running for
-    // that bridge — either it resolved, or inrush already gave up and
-    // escalated through its own _checkHBridgeFault() call above),
-    // these resume as a normal, independent backstop for a genuinely
-    // different, unrelated fault.
-    bool dccOwnedByInrush = (_inrushBridge == &_faultDcc);
-    bool smOwnedByInrush  = (_inrushBridge == &_faultSm);
-
-    if (!dccOwnedByInrush) {
-        if (dccEdge && _faultDcc.shouldEscalate(dccParams.windowMs, dccParams.retryCount)) {
-            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count: %u faults within %lums)", _faultDcc.name(), (unsigned)dccParams.retryCount, (unsigned long)dccParams.windowMs);
-            _checkHBridgeFault(_faultDcc);
-        }
-        if (_faultDcc.checkDuration(dccParams.durationMs, dccParams.clearMs)) {
-            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultDcc.name());
-            _checkHBridgeFault(_faultDcc);
-        }
-    }
-
-    if (!smOwnedByInrush) {
-        if (smEdge && _faultSm.shouldEscalate(smParams.windowMs, smParams.retryCount)) {
-            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count: %u faults within %lums)", _faultSm.name(), (unsigned)smParams.retryCount, (unsigned long)smParams.windowMs);
-            _checkHBridgeFault(_faultSm);
-        }
-        if (_faultSm.checkDuration(smParams.durationMs, smParams.clearMs)) {
-            traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultSm.name());
-            _checkHBridgeFault(_faultSm);
-        }
-    }
-
-    if (cdeEdge && _faultCde.shouldEscalate(cdeParams.windowMs, cdeParams.retryCount)) {
-        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (repeat count: %u faults within %lums)", _faultCde.name(), (unsigned)cdeParams.retryCount, (unsigned long)cdeParams.windowMs);
-        _checkHBridgeFault(_faultCde);
-    }
-    if (_faultCde.checkDuration(cdeParams.durationMs, cdeParams.clearMs)) {
-        traceLog().logf(TraceLevel::WARNING, TraceSource::HBRIDGE, "%s ESCALATE (continuous low duration)", _faultCde.name());
-        _checkHBridgeFault(_faultCde);
-    }
-
     // v2 hardware: ACK detection on all three bridges — only the one
     // actually routed to the track during service mode (currently
     // always HW_SM_ACTIVE) will see a meaningful pulse; see
@@ -819,6 +643,10 @@ void DccHal::loop() {
     _senseDcc.loop();
     _senseSm.loop();
     _senseCde.loop();
+
+    // nFAULT guards (state machines) — after the SENSE reads above so
+    // they see this pass's samples. See _updateGuards().
+    _updateGuards();
 
     if (_serviceModeRequested) {
         uint32_t timeoutMs = eepromStore().getUint32("dcc.svc_timeout_ms",
@@ -849,7 +677,12 @@ void DccHal::_onCommand(const Command& cmd) {
         (int)cmd.type, cmd.sourceId, cmd.address, cmd.speed, cmd.forward,
         cmd.stepMode, cmd.fn, cmd.fnState, cmd.output, cmd.active,
         cmd.cv, cmd.cvValue);
+    if ((cmd.type == CmdType::LOCO_SPEED || cmd.type == CmdType::LOCO_FUNCTION ||
+         cmd.type == CmdType::LOCO_ESTOP) && cmd.address != 0)
+        _instance->_noteOwner(cmd.address, cmd.sourceId);
     switch (cmd.type) {
+        case CmdType::STOP_LOCOS_OF:
+            _instance->_stopLocosOf((uint8_t)cmd.address); break;
         case CmdType::LOCO_SPEED:
             _instance->setSpeed(cmd.address, cmd.speed,
                                  cmd.forward, cmd.stepMode); break;
@@ -889,6 +722,13 @@ void DccHal::_onCommand(const Command& cmd) {
 //  revision to that booster dropped this signal, it's no longer
 //  wired to anything.)
 // ─────────────────────────────────────────────────────────────
+// ISR trampolines — see their declaration in dcc_hal.h for why these
+// exist and why they're kept this minimal (all the real work is in
+// NFaultSource::isrEdge(), which is itself already ISR-safe).
+void DccHal::_onDccFaultChange() { _instance->_srcDcc.isrEdge(); }
+void DccHal::_onSmFaultChange()  { _instance->_srcSm.isrEdge();  }
+void DccHal::_onCdeFaultChange() { _instance->_srcCde.isrEdge(); }
+
 void DccHal::_setMainOutputs(bool on) {
     digitalWrite(HW_DCC_ACTIVE, on ? HIGH : LOW);
     digitalWrite(HW_CDE_ACTIVE, on ? HIGH : LOW);
@@ -961,6 +801,8 @@ void DccHal::_exitServiceMode(bool ok, uint16_t cv, uint8_t value) {
 //  producing.
 // ─────────────────────────────────────────────────────────────
 void DccHal::setPower(bool on) {
+    if (on != _power)
+        traceLog().notef("[%lu] DCC: track power %s", millis(), on ? "ON" : "OFF");
     _power = on;
     _inEmergencyStop = false;  // any real power cycle supersedes an emergency-stop LED state
     if (on) {
@@ -969,6 +811,29 @@ void DccHal::setPower(bool on) {
         _powerOnMs         = millis();
         _cdeFaultSinceUs   = 0;  // don't let a stale fault window from
         _cdeRecoverSinceUs = 0;  // before this power-on carry over into it
+        // Fresh start for the nFAULT guards: no stale edges, state
+        // NORMAL, power estimate and duty statistic at zero. This runs
+        // before the outputs are enabled below, so the power-on inrush
+        // itself is seen as a new episode, as intended.
+        uint32_t nowUs = micros();
+        _srcDcc.clear(); _srcSm.clear(); _srcCde.clear();
+        _srcDcc.resetDuty(); _srcSm.resetDuty(); _srcCde.resetDuty();
+        _guardDcc.reset(nowUs); _guardSm.reset(nowUs); _guardCde.reset(nowUs);
+        _gpRefreshMs    = 0;
+        _restartPending = false;
+        if (!_autoRestarting) _restartCount = 0;   // a manual power-on starts over
+    } else {
+        // The inrush pattern must not outlive track power.
+        if (_guardDcc.inrushActive() || _guardSm.inrushActive()) {
+            dccPacketEngine.leaveInrushMode();
+        }
+        // Guards go back to NORMAL, except one that just reported SHORT
+        // (kept for the status display until the next power-on).
+        uint32_t nowUs = micros();
+        if (_guardDcc.state() != HBridgeGuard::State::Shorted) _guardDcc.reset(nowUs);
+        if (_guardSm.state()  != HBridgeGuard::State::Shorted) _guardSm.reset(nowUs);
+        if (_guardCde.state() != HBridgeGuard::State::Shorted) _guardCde.reset(nowUs);
+        _restartPending = false;   // any power-off cancels a pending restart
     }
     // _dcc.setpower(..., true) already calls notifyRailpower() itself
     // (synchronously — see DCCPacketScheduler::setpower() in the
@@ -1065,6 +930,58 @@ uint8_t DccHal::_scaleSpeed(uint8_t speed, uint8_t mode) {
         uint16_t s = 4 + ((uint16_t)(speed - 2) * span + range / 2) / range;
         return (uint8_t)(s > 31 ? 31 : s);
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Loco ownership — which module last drove a loco
+//
+//  _noteOwner(): called for every loco speed/function/estop command.
+//  _stopLocosOf(): emergency-stops every MOVING loco whose last command
+//  came from module `src`, through the LocoRepository (speed 1 = DCC
+//  emergency stop in every step mode, see _scaleSpeed()), so the
+//  normal dirty-loco path sends the packet and the repository shows
+//  the loco as stopped to every other client.
+// ─────────────────────────────────────────────────────────────
+void DccHal::_noteOwner(uint16_t addr, uint8_t src) {
+    for (uint8_t i = 0; i < LOCO_OWNERS; i++) {
+        if (_owners[i].addr == addr) { _owners[i].src = src; return; }
+    }
+    for (uint8_t i = 0; i < LOCO_OWNERS; i++) {
+        if (_owners[i].addr == 0) { _owners[i] = { addr, src }; return; }
+    }
+    _owners[_ownerNext] = { addr, src };          // full: reuse round-robin
+    _ownerNext = (uint8_t)((_ownerNext + 1) % LOCO_OWNERS);
+}
+
+void DccHal::_stopLocosOf(uint8_t src) {
+    uint8_t n = 0;
+    char list[96]; int len = 0; list[0] = '\0';
+    for (uint8_t i = 0; i < LOCO_OWNERS; i++) {
+        if (_owners[i].addr == 0 || _owners[i].src != src) continue;
+        uint16_t addr = _owners[i].addr;
+        // NOTE: not LocoRepository::setSpeed() — that only sets the
+        // generic dirty flag, not the speed-dirty flag, so
+        // _processDirtyLocos() never sent a packet for it (Rob, Oct 2026:
+        // "emergency stop for 3 locos" logged, locos kept running).
+        // Set the speed and mark it speed-dirty explicitly; the normal
+        // dirty-loco path then sends the emergency stop in the loco's
+        // own step mode and the DCC refresh carries it from then on.
+        if (!locoRepo().lockWrite(500)) continue;
+        LocoBase* l = locoRepo().findOrCreate(addr);   // exists: we drove it
+        bool moving = l && l->speed >= 2;
+        if (moving) {
+            l->speed = 1;                               // 1 = emergency stop
+            locoRepo().markDirtySpeed(addr);
+        }
+        locoRepo().unlock();
+        if (!moving) continue;
+        n++;
+        if (len >= 0 && len < (int)sizeof(list) - 8)
+            len += snprintf(list + len, sizeof(list) - (size_t)len, " %u", addr);
+    }
+    traceLog().logf(TraceLevel::WARNING, TraceSource::DCCHAL,
+                    "emergency stop for %u loco(s) last driven by module 0x%02X:%s",
+                    (unsigned)n, src, n ? list : " (none moving)");
 }
 
 // ─────────────────────────────────────────────────────────────

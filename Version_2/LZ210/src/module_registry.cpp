@@ -10,6 +10,7 @@
 #include "event_bus.h"
 #include "command_bus.h"
 #include "module_registry.h"
+#include "crash_diag.h"   // breadcrumbs: where each core is (survives a watchdog reset)
 extern bool gEthernetUsesDhcp;
 
 // ─────────────────────────────────────────────────────────────
@@ -203,14 +204,18 @@ void ModuleRegistry::beginCore1() {
 // ─────────────────────────────────────────────────────────────
 void ModuleRegistry::loopCore0() {
     // Process commands from core1 → core0 via CommandBus ring buffer
+    CrashDiag::crumb(0, CrashDiag::ST_CMDBUS);
     CommandBus::instance().poll();
 
     for (uint8_t i = 0; i < _count; i++) {
         if (!_modules[i]->enabled()) continue;
         ModuleCore c = _modules[i]->core();
-        if (c == ModuleCore::CORE0 || c == ModuleCore::BOTH)
+        if (c == ModuleCore::CORE0 || c == ModuleCore::BOTH) {
+            CrashDiag::crumb(0, CrashDiag::ST_MODULE, i);
             _modules[i]->loop();
+        }
     }
+    CrashDiag::crumb(0, CrashDiag::ST_LOOP_END);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -242,9 +247,17 @@ void ModuleRegistry::loopCore1() {
     for (uint8_t i = 0; i < _count; i++) {
         if (!_modules[i]->enabled()) continue;
         if (_modules[i]->core() == ModuleCore::CORE1) {
+            CrashDiag::crumb(1, CrashDiag::ST_MODULE, i);
             _modules[i]->loop();
+            // Heartbeat after every module, not only at the end of
+            // loop1(): core0's stall check (loop() in LZ210.ino) then
+            // measures how long ONE module call takes, not the sum of
+            // all of them, so it can be set tighter without false trips.
+            extern volatile uint32_t gCore1LastAliveMs;
+            gCore1LastAliveMs = millis();
         }
     }
+    CrashDiag::crumb(1, CrashDiag::ST_EVENTBUS);
     EventBus::instance().poll();
 
     // Ethernet.maintain() only when DHCP is active.
@@ -254,6 +267,7 @@ void ModuleRegistry::loopCore1() {
         uint32_t now = millis();
         if (now - sLastMaintain >= 60000) {
             sLastMaintain = now;
+            CrashDiag::crumb(1, CrashDiag::ST_ETH_MAINTAIN);
             Ethernet.maintain();
         }
     }

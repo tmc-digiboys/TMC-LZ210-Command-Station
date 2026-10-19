@@ -67,6 +67,23 @@ private:
     // "web.port" web-interface setting entirely.
     EthernetServer* _server = nullptr;
     uint8_t        _activeClients = 0;
+    uint16_t       _port = WEB_PORT;   // port actually used by begin()
+
+    // ── W5500 socket diagnostics (temporary) ──────────────
+    // The web interface was found unreachable after a while during a
+    // 5-loco run (Rob, Oct 2026) while LenzLAN (same core1 loop) kept
+    // working — pointing at socket exhaustion: the W5500 has only 8
+    // hardware sockets and the web server may lose its listening
+    // socket to another server. _logSockets() samples every socket's
+    // status and local port once per second and writes one line to
+    // the trace log whenever the picture changes (plus every 30s
+    // regardless), and a WARNING while no socket is listening on the
+    // web port. Diagnostic only: it changes no behaviour.
+    void     _logSockets();
+    uint32_t _sockSampleMs = 0;
+    uint32_t _sockLogMs    = 0;
+    bool     _webListenLost = false;
+    char     _sockLast[112] = {};
 
     // Reads the HTTP request from the client and dispatches to handlers
     void _handleClient(EthernetClient& client);

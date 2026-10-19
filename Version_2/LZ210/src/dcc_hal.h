@@ -25,7 +25,7 @@
 //                     margin of roughly 7x against false triggers.
 //    GP27 (pinAck)  — legacy v1 ACK/short-circuit pin, superseded on
 //                     v2 hardware by the three dedicated nFAULT/SENSE
-//                     pin pairs below (HBridgeFault/DccCurrentMonitor)
+//                     pin pairs below (NFaultSource+HBridgeGuard/DccCurrentMonitor)
 //
 //  Turnout addressing (configured via web interface, stored in EEPROM):
 //    dcc.swschema: 0=ROCO (offset 3, linear), 1=IB (offset 7, linear),
@@ -40,7 +40,7 @@
 //
 //  v2 hardware: three onboard H-bridges (DCC main, SM/programming
 //  track, CDE), each with its own nFAULT pin (short-circuit/
-//  overcurrent, see hbridge_fault.h) and SENSE pin (decoder ACK
+//  overcurrent, see hbridge_guard.h) and SENSE pin (decoder ACK
 //  detection, see dcc_current_monitor.h). Superseded the old,
 //  single-pin GP27 approach (see the pinAck note above), which
 //  targeted a DRV8871 H-bridge unsuitable for current sensing.
@@ -51,10 +51,11 @@
 #include "command_bus.h"
 #include "event_bus.h"
 #include "loco_repository.h"
-#include "hbridge_fault.h"
+#include "nfault_source.h"
+#include "hbridge_guard.h"
 #include "dcc_current_monitor.h"
 #include <DCCPacketScheduler_new.h>
-#include <DCCHardware.h>  // dccPacketEngine — enterInrushMode()/leaveInrushMode()/isInrushModeEnabled(), see _updateInrush()
+#include <DCCHardware.h>  // dccPacketEngine — enterInrushMode()/leaveInrushMode()/isInrushModeEnabled(), see HBridgeGuard
 
 // ADC-based CDE short-circuit detection. Superseded the earlier
 // digital (digitalRead()) approach entirely: the E-signal's voltage
@@ -238,27 +239,26 @@ public:
     // Returns current track power state
     bool getPower() const { return _power; }
 
-    // v2 hardware: read-only access to the three H-bridges' fault/ACK
-    // monitors, for the web interface status display (see
-    // webserver.cpp's _panelDccHal()).
-    const HBridgeFault&     faultDcc() const { return _faultDcc; }
-    const HBridgeFault&     faultSm()  const { return _faultSm;  }
-    const HBridgeFault&     faultCde() const { return _faultCde; }
+    // v2 hardware: read-only access to the three H-bridges' nFAULT
+    // sources and guards (state machine), for the web interface status
+    // display (see webserver.cpp's _panelDccHal()).
+    const NFaultSource&  srcDcc()   const { return _srcDcc; }
+    const NFaultSource&  srcSm()    const { return _srcSm;  }
+    const NFaultSource&  srcCde()   const { return _srcCde; }
+    const HBridgeGuard&  guardDcc() const { return _guardDcc; }
+    const HBridgeGuard&  guardSm()  const { return _guardSm;  }
+    const HBridgeGuard&  guardCde() const { return _guardCde; }
 
-    // For the web interface's H-bridge status table — is the inrush
-    // state machine (see _updateInrush()) currently active, and for
-    // which bridge? Returns nullptr's name ("") when idle.
-    bool        inrushActive() const     { return _inrushBridge != nullptr; }
-    const char* inrushBridgeName() const { return _inrushBridge ? _inrushBridge->name() : ""; }
+    // Automatic restart bookkeeping, for the same status display.
+    uint8_t restartCount()   const { return _restartCount; }
+    bool    restartPending() const { return _restartPending; }
 
-    // Resets all three bridges' nFAULT counters (raw + debounced) —
-    // see HBridgeFault::resetFaultCounts()'s own comment. Web
-    // interface's "Reset nFAULT counters" button (H-bridge status
-    // table) is the only caller.
+    // Resets all three bridges' nFAULT counters and guard statistics.
+    // Web interface's "Reset nFAULT counters" button (H-bridge status
+    // table) is the only caller. In-RAM only, by design.
     void resetHBridgeFaultCounts() {
-        _faultDcc.resetFaultCounts();
-        _faultSm.resetFaultCounts();
-        _faultCde.resetFaultCounts();
+        _srcDcc.resetCounts(); _srcSm.resetCounts(); _srcCde.resetCounts();
+        _guardDcc.resetStats(); _guardSm.resetStats(); _guardCde.resetStats();
     }
     const DccCurrentMonitor& senseDcc() const { return _senseDcc; }
     const DccCurrentMonitor& senseSm()  const { return _senseSm;  }
@@ -334,6 +334,16 @@ private:
     // Static CommandBus handler — called on core0 for each incoming command
     static void _onCommand(const Command& cmd);
 
+    // Which module last drove each loco (speed/function/estop), so a
+    // lost controller's locos can be stopped selectively. Small table,
+    // oldest entry reused when full. core0 only.
+    struct LocoOwner { uint16_t addr; uint8_t src; };
+    static constexpr uint8_t LOCO_OWNERS = 64;
+    LocoOwner _owners[LOCO_OWNERS] = {};
+    uint8_t   _ownerNext = 0;
+    void _noteOwner(uint16_t addr, uint8_t src);
+    void _stopLocosOf(uint8_t src);
+
     // Checks the CDE short-circuit flag and triggers power-off if set
     void _checkCdeShort();
 
@@ -347,6 +357,18 @@ private:
     // setPower(), staying on throughout a service-mode session — see
     // setPower()'s comment).
     void _setMainOutputs(bool on);
+
+    // ISR trampolines for the three nFAULT pins — see nfault_source.h
+    // for why edge capture is interrupt-driven. Static member
+    // functions (not plain member functions) so they're usable as the
+    // plain function pointer attachInterrupt() requires, while still
+    // having private access to _srcDcc/_srcSm/_srcCde via _instance
+    // (the same static pointer notifyRailpower() already uses for the
+    // same reason). Each just forwards to that bridge's own
+    // isrEdge(); kept minimal for ISR safety.
+    static void _onDccFaultChange();
+    static void _onSmFaultChange();
+    static void _onCdeFaultChange();
 
     // v2 hardware: ends the current service-mode session (called from
     // notifyCVVerify()/notifyCVNack() on a definite result, or from
@@ -393,37 +415,43 @@ private:
     static uint8_t _scaleSpeed(uint8_t speed, uint8_t mode);
 
     // v2 hardware: the three onboard H-bridges' low-active nFAULT
-    // pins (DCC/main, SM/programming track, CDE/local booster output)
-    // — short-circuit/overcurrent/overtemperature detection. See
-    // hbridge_fault.h for the full reasoning, including the confirmed
-    // active-low polarity (TI "nFAULT" naming convention).
-    HBridgeFault _faultDcc{HW_DCC_FAULT, "DCC"};
-    HBridgeFault _faultSm {HW_SM_FAULT,  "SM"};
-    HBridgeFault _faultCde{HW_CDE_FAULT, "CDE"};
+    // pins (DCC/main, SM/programming track, CDE/local booster output).
+    // NFaultSource captures the edges (interrupt, microsecond
+    // timestamps); HBridgeGuard is the state machine that decides what
+    // they mean — see nfault_source.h and hbridge_guard.h. There is
+    // exactly one place a bridge fault can power the station off:
+    // _onGuardShort().
+    NFaultSource _srcDcc{HW_DCC_FAULT, "DCC"};
+    NFaultSource _srcSm {HW_SM_FAULT,  "SM"};
+    NFaultSource _srcCde{HW_CDE_FAULT, "CDE"};
+    HBridgeGuard _guardDcc;
+    HBridgeGuard _guardSm;
+    HBridgeGuard _guardCde;
 
-    // Inrush-protection state machine — see _updateInrush()'s own
-    // comment (dcc_hal.cpp) for the full algorithm. Only ever applies
-    // to whichever of DCC/SM is the currently ACTIVE output (they
-    // share the one PIO/DMA-generated DCC signal — see
-    // dccPacketEngine's own header comment on call order — so only one
-    // of them is ever actually driving anything at a time); CDE is not
-    // covered (Rob: only DCC and SM talk directly to locos, CDE
-    // doesn't). Idle (_inrushBridge == nullptr) most of the time.
-    bool          _inrushLowSense       = false;    // this attempt was started for a low-sense (suspected UVLO/CPUV/TSD) fault
-    HBridgeFault* _inrushBridge         = nullptr;  // which bridge this run is for, or nullptr when idle
-    uint32_t      _inrushStartMs        = 0;        // when this inrush attempt began
-    uint32_t      _inrushBurstStartMs   = 0;        // start of the current burst-check period
-    uint16_t      _inrushBurstCount     = 0;        // periods elapsed so far this attempt
-    uint32_t      _inrushShortSinceMs   = 0;        // when SENSE first crossed the short threshold, 0 = not currently crossing
-    void _updateInrush(bool dccEdge, bool smEdge);
+    // Guard parameters, rebuilt from EEPROM a few times per second
+    // (not on every loop() pass), per bridge.
+    HBridgeGuard::Params _gpDcc{}, _gpSm{}, _gpCde{};
+    uint32_t             _gpRefreshMs = 0;
+    void _refreshGuardParams();
+    void _updateGuards();
 
-    // Shared handler for all three HBridgeFault instances above —
-    // called once per bridge from loop(). Checks for a newly detected
-    // fault and, on any fault, cuts track power station-wide (unlike
-    // the CDE E-signal's configurable sys.cde_mode, a genuine nFAULT
-    // from the bridge's own silicon is treated as always-serious —
-    // no "log only" option).
-    void _checkHBridgeFault(HBridgeFault& fb);
+    // Hooks the guards call. Static + a bridge index in ctx (0=DCC,
+    // 1=SM, 2=CDE) because the guard header does not know DccHal.
+    static void _guardEnterInrush(void* ctx);
+    static void _guardLeaveInrush(void* ctx);
+    static void _guardShort(void* ctx, const char* why);
+    void _onGuardShort(uint8_t bridge, const char* why);
+
+    // Automatic restart after a guard SHORT (the designer's "wait 1s,
+    // then restart"). Limited to nf.restart_max attempts so a real
+    // short does not cycle forever; a manual power-on resets the count,
+    // as does 10s of uninterrupted running after a restart.
+    bool     _restartPending  = false;
+    uint32_t _restartAtMs     = 0;
+    uint8_t  _restartCount    = 0;
+    uint32_t _lastRestartMs   = 0;
+    bool     _autoRestarting  = false;   // true only inside _autoRestart()
+    void _autoRestart();
 
     // v2 hardware: the three onboard H-bridges' analogue SENSE lines
     // — decoder ACK detection. See dcc_current_monitor.h for the full

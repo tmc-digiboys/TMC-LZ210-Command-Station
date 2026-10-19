@@ -19,12 +19,64 @@
 //  instances" pattern used elsewhere in this project (see
 //  DccCurrentMonitor for the equivalent on the SENSE lines) — rather
 //  than writing three nearly identical blocks of fault-checking code.
-//  It only detects and debounces the raw nFAULT signal; the decision
-//  of whether a fault event should actually escalate to a
-//  station-wide power-off lives in shouldEscalate() below, and is
-//  acted on by DccHal — see its comment for why an isolated fault
-//  blip is expected and normal on this hardware, and only repeated
-//  faults warrant real action.
+//  It only detects the raw nFAULT signal; the decision of whether a
+//  fault event should actually escalate to a station-wide power-off
+//  lives in shouldEscalate() below, and is acted on by DccHal — see
+//  its comment for why an isolated fault blip is expected and normal
+//  on this hardware, and only repeated faults warrant real action.
+//
+//  INTERRUPT-DRIVEN, NOT POLLED (Rob, schematic review): nFAULT on
+//  this hardware is confirmed Quad-Level 2 (RIMODE = 20kOhm to GND —
+//  visible on the LZ210-TMC schematic, "DCC-Out" sheet), which per
+//  the DRV8874/DRV8876 datasheet's Table 7-6 means Cycle-By-Cycle
+//  current chopping, not the fixed-off-time automatic-retry this
+//  class originally assumed. That matters because nFAULT now also
+//  pulses for every ordinary chopping event — normal current
+//  limiting, e.g. while a loco accelerates — not only for a genuine
+//  overcurrent retry. The two are electrically distinguishable only
+//  by HOW LONG the pin stays low: per both chips' electrical
+//  characteristics tables (identical on this point), a chop is
+//  tOFF = 25us typical, while a genuine OCP retry is tRETRY = 2ms
+//  typical — a ~80x difference. Catching a 25us pulse reliably is not
+//  achievable by polling digitalRead() from loop() (core0 also runs
+//  DCC/RS-Bus/command-and-event work, with no guaranteed upper bound
+//  on the gap between iterations), so this class now uses
+//  attachInterrupt() on CHANGE and times each low period with
+//  micros() in the ISR itself — see isrEdge() below.
+//
+//  DCC and SM drive an individual loco's decoder directly, so they
+//  see this per-loco chatter and FILTER chop-class events out
+//  entirely (see check()'s filterChops parameter) — they are the
+//  driver doing its job, not a fault. CDE drives a booster network,
+//  not a loco, so it never sees that per-loco chop pattern in the
+//  first place (confirmed, Rob) — a low reading there is already
+//  meaningful, so CDE does not filter, and the same duration split
+//  is used instead to help quantify what kind of condition it is
+//  (an isolated event versus a repeating ~2ms retry pattern, which
+//  would suggest a structurally overloaded output rather than a
+//  one-off blip).
+//
+//  DUTY-CYCLE TRACKING (updateDuty()/dutyPermille() below) — added
+//  after a first attempt at sustained-overload detection (squaring
+//  and leaky-integrating the SENSE/ADC reading, per the hardware
+//  designer's own power-dissipation reasoning) turned out unusable in
+//  practice: confirmed on the bench (Rob), a loco already known bad
+//  (continuous nFAULT chopping on the scope, ~55-60us square wave,
+//  seconds long) produced a LOWER integrated SENSE reading at the
+//  moment it escalated (307mV) than an ordinary HEALTHY loco's normal
+//  peak readings during plain driving (369mV) — i.e. no threshold
+//  could separate the two cases. Root cause: sampling the ADC only
+//  ~once per ms against a ~55-60us chop period is badly aliased —
+//  each sample is essentially a coin flip between the chop's on/off
+//  phase, not a meaningful power measurement. Rather than sampling
+//  the ADC faster (considered and rejected — see DccHal's own
+//  comment on why doing ADC reads from this ISR specifically was
+//  judged too risky, a single shared ADC peripheral with no
+//  interrupt-safety guarantee in the Arduino framework), duty-cycle
+//  tracking reuses the exact, already-interrupt-timed low-period
+//  durations this class captures for chop/OCP classification anyway
+//  — no ADC involved at all, so no aliasing is possible by
+//  construction.
 // ═══════════════════════════════════════════════════════════════
 #include <Arduino.h>
 
@@ -33,18 +85,20 @@
 //  H-bridge's low-active nFAULT pin.
 //
 //  A single, isolated nFAULT edge is not necessarily a genuine,
-//  ongoing problem: the DRV887x chips have their own automatic-retry
-//  overcurrent response (IMODE=GND on this board — confirmed by Rob
-//  against the datasheet's Table 7-6 "IMODE Functions": fixed
-//  off-time, automatic retry), which briefly disables the outputs and
-//  self-recovers WITHOUT needing an external reset. A brief, isolated
-//  nFAULT blip is expected and harmless in this configuration — for
-//  example, the inrush current a decoder's input capacitor draws when
-//  a loco first makes rail contact, or the back-EMF/inductive
-//  kickback as a motor's magnetic field collapses when it stops, both
-//  confirmed present in practice (Rob: faults observed both when a
-//  loco is simply moved by hand on the rails, and right as another
-//  loco comes to a stop) — neither is a genuine, sustained fault.
+//  ongoing problem. On DCC/SM most of what trips nFAULT is the
+//  DRV887x's own Cycle-By-Cycle current chopping (confirmed
+//  Quad-Level 2, see the top-of-file comment) — routine current
+//  limiting, filtered out entirely below. What remains after that
+//  filter still has its own automatic-retry behaviour for a genuine
+//  overcurrent event (tRETRY = 2ms typical), which briefly disables
+//  the outputs and self-recovers WITHOUT needing an external reset —
+//  so even a filtered, "real" fault event is often still just the
+//  inrush current a decoder's input capacitor draws when a loco first
+//  makes rail contact, or the back-EMF/inductive kickback as a
+//  motor's magnetic field collapses when it stops, both confirmed
+//  present in practice (Rob: faults observed both when a loco is
+//  simply moved by hand on the rails, and right as another loco comes
+//  to a stop) — neither is a genuine, sustained fault.
 //
 //  What DOES indicate a genuine problem is faults recurring
 //  repeatedly within a short window (the chip's own automatic-retry
@@ -66,48 +120,156 @@ public:
     // pull-up per the datasheet's recommended circuit, but an
     // internal one costs nothing and protects against ever reading a
     // floating/undefined level as a false fault if that external
-    // pull-up is ever missing or damaged).
+    // pull-up is ever missing or damaged). Does NOT attach the
+    // interrupt — call attachIsr() separately once, after begin(),
+    // with a free function specific to this instance (see
+    // DccHal::begin() for the three call sites — one ISR trampoline
+    // function per bridge, since attachInterrupt() needs a plain
+    // function pointer, not a bound member function).
     void begin() { pinMode(_pin, INPUT_PULLUP); }
 
-    // Call every loop() iteration. Returns true exactly once per
-    // fault event (edge-triggered on the transition into the fault
-    // state), not continuously for as long as the pin stays low.
-    // Debounced: the pin must read LOW on debounceSamples consecutive
-    // calls before it counts as an edge, to reject a short glitch,
-    // though the chip's own nFAULT flag is expected to already be
-    // clean. debounceSamples is passed in by the caller (DccHal reads
-    // it per bridge from EEPROM, "<prefix>.fault_debounce") — this
-    // class deliberately does no EEPROM lookups itself. NOTE: it
-    // counts loop() iterations, NOT time — the real-world duration a
-    // given count represents depends on how fast loop() runs. The
-    // default of 3 is the value that used to be hardcoded here. 0 and
-    // 1 both mean "no debounce" (first low sample counts). Every true
-    // return is also recorded into the recent-fault history used by
-    // shouldEscalate() below.
+    void attachIsr(void (*isr)()) {
+        attachInterrupt(digitalPinToInterrupt(_pin), isr, CHANGE);
+    }
+
+    // Called from this bridge's ISR trampoline on EVERY change of the
+    // nFAULT pin (both edges). Deliberately minimal and ISR-safe:
+    // only micros() (interrupt-safe on RP2350/Arduino-Pico) and a
+    // lock-free push into a small ring buffer — no TraceLog, no
+    // EEPROM, no millis()-based logic, all of which belong in
+    // check() below instead, called from loop() on the same core this
+    // interrupt fires on (DccHal is a core0 module — see its own
+    // architecture comment — so no cross-core buffer access here).
     //
-    // Also maintains faultCountRaw() (below) — a SEPARATE count,
-    // incremented on every raw low-going transition, BEFORE the
-    // debounce filter runs, so a short glitch that
-    // never reaches faultCount() (the debounced count) still shows up
-    // there. Requested explicitly (Rob): the raw count is the more
-    // meaningful of the two for judging how electrically noisy a
-    // bridge's nFAULT line actually is — the debounced count alone can
-    // hide that, since several raw glitches close together collapse
-    // into at most one debounced edge (check() ignores the pin
-    // entirely while _wasLow is already true).
-    bool check(uint16_t debounceSamples = 3) {
-        bool faultNow = (digitalRead(_pin) == LOW);
+    // On a FALLING edge, just remembers when. On a RISING edge, the
+    // low period that just ended is now fully known — pushes its
+    // duration (microseconds) into the ring buffer for check() to
+    // classify later. This means a fault is only reported once it has
+    // already CLEARED, not at the moment it began — a deliberate
+    // trade-off: classifying chop (~25us) vs a genuine OCP retry
+    // (~2ms) requires knowing the full duration, which isn't known
+    // until the pin goes back high. checkDuration() below is
+    // unaffected by this — it polls the live pin directly every
+    // loop() iteration, so a fault that never clears at all (no rising
+    // edge ever fires) is still caught by it regardless of what this
+    // ISR sees.
+    void isrEdge() {
+        uint32_t now = micros();
+        if (digitalRead(_pin) == LOW) {
+            _fallUs = now;
+            return;
+        }
+        uint32_t durationUs = now - _fallUs;
+        // Sanity cap, duty-tracking only (NOT the ring buffer below —
+        // chop/OCP classification still sees the full, uncapped
+        // duration). Suspected cause of a reproducible, suspiciously
+        // consistent ~25% duty reading after only a brief, harmless
+        // inrush blip (Rob, TraceLog, three separate occurrences
+        // converging on 25.0-25.4%): electrical noise/bounce on this
+        // fast-switching pin around an edge can make digitalRead()
+        // here see a different level than the one that actually
+        // triggered this ISR call, computing durationUs against a
+        // stale _fallUs — a single such misread, tens of thousands of
+        // us, is enough to dominate an entire 100ms duty window on its
+        // own (0 - 0 + (1000>>2) = exactly 25.0%, matching what was
+        // observed). Capped well above the known-legitimate tRETRY
+        // scale (~2ms) so no genuine OCP-retry duration is affected.
+        uint32_t dutyUs = durationUs;
+        if (dutyUs > DUTY_SANITY_CAP_US) dutyUs = DUTY_SANITY_CAP_US;
+        _lowUsWindow += dutyUs;  // see updateDuty()'s own comment
+        uint8_t next = (uint8_t)((_edgeHead + 1) % EDGE_BUF_SIZE);
+        if (next == _edgeTail) { _edgeDropped++; return; }  // consumer not keeping up — drop, don't block
+        _edgeBuf[_edgeHead] = durationUs;
+        _edgeHead = next;
+    }
 
-        if (faultNow && !_wasRawLow) _faultCountRaw++;
-        _wasRawLow = faultNow;
-
-        if (!faultNow) { _wasLow = false; _lowCount = 0; return false; }
-        if (_wasLow) return false;          // already reported, still ongoing
-        if (_lowCount < 0xFFFF) _lowCount++;  // saturate rather than wrap
-        if (_lowCount < debounceSamples) return false;  // debounce: N consecutive lows
-        _wasLow = true;
-        _recordFault();
+    // Duty-cycle tracking — see the file-level comment's own note on
+    // why this exists (SENSE-based sustained-power detection turned
+    // out unusable: aliasing against a ~55-60us chop with ~1ms
+    // sampling made a confirmed-bad loco read LOWER than normal
+    // peaks on a healthy one). This instead uses the exact,
+    // interrupt-timed low-period durations already captured above —
+    // no ADC, no aliasing, no new hardware access at all — to track
+    // what FRACTION of time nFAULT has actually been low, which
+    // should scale directly with how hard the driver is being pushed
+    // regardless of chop frequency.
+    //
+    // Call every loop() iteration (cheap — just a timestamp compare
+    // most calls); only does real work once windowUs has elapsed.
+    // Each window's raw duty (low-time / windowUs, in permille,
+    // 0-1000 = 0.0%-100.0%) is fed through a leaky integrator across
+    // windows (same leaky-bucket technique as PowerIntegrator used,
+    // minus the SENSE/ADC dependency that made that one unreliable):
+    // acc = acc - (acc>>shift) + (rawPermille>>shift). shift controls
+    // how many windows of elevated duty it takes to trip — e.g.
+    // shift=2 means roughly 4 windows' worth of persistence needed,
+    // so one single elevated window (a brief, legitimate burst)
+    // doesn't trip it on its own.
+    // Returns true exactly when a window just closed and dutyPermille()
+    // was freshly updated this call — false otherwise (nothing to
+    // report yet). Lets a caller log/react only on actual updates
+    // instead of every loop() iteration.
+    bool updateDuty(uint32_t windowUs, uint8_t shift) {
+        uint32_t now = micros();
+        if (now - _windowStartUs < windowUs) return false;
+        uint32_t lowUs = _lowUsWindow;
+        _lowUsWindow   = 0;
+        _windowStartUs = now;
+        uint32_t rawPermille = (lowUs * 1000UL) / windowUs;
+        if (rawPermille > 1000) rawPermille = 1000;  // clamp — a low period spanning the window boundary could otherwise overshoot slightly
+        _dutyAcc = _dutyAcc - (_dutyAcc >> shift) + (rawPermille >> shift);
         return true;
+    }
+
+    // Current smoothed duty cycle, in permille (0-1000 = 0.0%-100.0%)
+    // — for the web interface and for DccHal's own trip comparison.
+    uint16_t dutyPermille() const { return (uint16_t)_dutyAcc; }
+
+    // Resets duty tracking to zero — called on a genuine power-on
+    // (DccHal::setPower()), same reasoning as resetDuration(): a
+    // previous session's accumulated duty should never carry across
+    // a power cycle, and after escalating on it, so the next
+    // power-on starts clean rather than already primed near the
+    // trip point.
+    void resetDuty() { _dutyAcc = 0; _lowUsWindow = 0; }
+
+    // Call every loop() iteration. Drains ISR-captured completed
+    // low-periods and classifies each: chopUs is the boundary between
+    // a chop pulse (tOFF, ~25us typical) and a genuine OCP retry
+    // (tRETRY, ~2ms typical) — see the class comment above. A
+    // duration at or below chopUs is a chop.
+    //
+    // filterChops = true (DCC/SM): chop-class events are silently
+    // discarded entirely — not counted anywhere, not recorded, not
+    // logged — since they are the driver doing its job, not a fault.
+    // filterChops = false (CDE): every event counts, chop-class
+    // included, since CDE never sees per-loco chop in the first place
+    // (see class comment) — a low reading there is already
+    // meaningful.
+    //
+    // Returns true if at least one qualifying (non-filtered) event was
+    // drained this call, and records each into the recent-fault
+    // history used by shouldEscalate() below. chopUs is passed in by
+    // the caller (DccHal reads it from EEPROM, "dcc.fault_chop_us")
+    // — this class deliberately does no EEPROM lookups itself.
+    //
+    // faultCountRaw() (below) counts every drained event regardless of
+    // filterChops — including chop-class ones even when they're
+    // filtered out of faultCount() — so the web interface can still
+    // show how electrically busy a DCC/SM line really is, chop
+    // included, even though none of that reaches the fault/escalation
+    // logic.
+    bool check(uint32_t chopUs, bool filterChops) {
+        bool any = false;
+        while (_edgeTail != _edgeHead) {
+            uint32_t durationUs = _edgeBuf[_edgeTail];
+            _edgeTail = (uint8_t)((_edgeTail + 1) % EDGE_BUF_SIZE);
+            _faultCountRaw++;
+            if (filterChops && durationUs <= chopUs) continue;  // routine chopping, not a fault
+            _recordFault();
+            any = true;
+        }
+        return any;
     }
 
     // Call after check() returns true, to decide whether this fault
@@ -247,25 +409,60 @@ public:
     // for explicitly: counts across the board's uptime, resettable
     // via a button, not meant to survive a power cycle).
     //
-    // faultCountRaw(): every individual low-going transition on the
-    // pin, before the debounce filter.
-    // faultCount(): only the edges that passed that filter (the same
-    // signal shouldEscalate() is built from) — NOT gated on whether
-    // that particular edge went on to escalate, so an isolated,
-    // harmless blip (see this class's own comment on why those are
-    // expected and normal) still increments this one too.
+    // faultCountRaw(): every completed low-period the ISR captured,
+    // chop-class included even when filterChops discards it from
+    // everything else.
+    // faultCount(): only the ones that passed the chop filter (the
+    // same signal shouldEscalate() is built from) — NOT gated on
+    // whether that particular edge went on to escalate, so an
+    // isolated, harmless one still increments this too. For CDE
+    // (filterChops=false), the two are identical.
     uint32_t faultCountRaw() const { return _faultCountRaw; }
     uint32_t faultCount()    const { return _faultCount; }
     void     resetFaultCounts() { _faultCount = 0; _faultCountRaw = 0; }
 
+    // Diagnostic: how many completed low-periods the ISR had to drop
+    // because check() wasn't draining the ring buffer fast enough.
+    // Should stay at 0 in practice — loop() runs far more often than
+    // EDGE_BUF_SIZE fault events should ever queue up between calls.
+    uint32_t edgeDropped() const { return _edgeDropped; }
+
 private:
     uint8_t     _pin;
     const char* _name;
-    bool        _wasLow     = false;
-    uint16_t    _lowCount   = 0;
-    bool        _wasRawLow  = false;
     uint32_t    _faultCount    = 0;
     uint32_t    _faultCountRaw = 0;
+
+    // ISR-captured completed low-periods (microseconds), drained by
+    // check(). volatile: written from isrEdge() (an interrupt
+    // context), read from check() (ordinary loop() context) — without
+    // this, the compiler would be free to cache stale values across
+    // that boundary. Sized generously (32, matching
+    // HBRIDGE_FAULT_HISTORY below) — chop events are frequent during
+    // ordinary chopping. Ring-buffer indices are single bytes, so
+    // read/write is atomic on this platform without needing a
+    // critical section.
+    // See isrEdge()'s own comment — a single ISR-computed low-period
+    // credited toward duty tracking is capped at this many
+    // microseconds, generously above the legitimate tRETRY scale
+    // (~2ms), to stop a suspected electrical-noise misread from
+    // dominating an entire duty window on its own.
+    static constexpr uint32_t DUTY_SANITY_CAP_US = 10000;
+    static constexpr uint8_t EDGE_BUF_SIZE = 32;
+    volatile uint32_t _edgeBuf[EDGE_BUF_SIZE] = {0};
+    volatile uint8_t  _edgeHead = 0;
+    volatile uint8_t  _edgeTail = 0;
+    volatile uint32_t _fallUs   = 0;  // ISR-internal: timestamp of the most recent falling edge
+    volatile uint32_t _edgeDropped = 0;
+
+    // Duty-cycle tracking state — see updateDuty()'s own comment.
+    // _lowUsWindow: accumulated low-microseconds within the CURRENT
+    // window, written from the ISR (isrEdge()) and read/reset from
+    // updateDuty() (ordinary loop() context) — volatile for the same
+    // cross-context reason as the edge buffer above.
+    volatile uint32_t _lowUsWindow = 0;
+    uint32_t _windowStartUs = 0;  // when the current window began (micros())
+    uint32_t _dutyAcc       = 0;  // leaky-integrated duty, permille (0-1000)
 
     // Small ring buffer of recent fault timestamps, used by
     // shouldEscalate() above to detect repeated faults within a

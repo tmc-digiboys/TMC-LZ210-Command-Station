@@ -10,7 +10,7 @@
 //
 //  Short-circuit/overcurrent detection is now handled separately and
 //  more reliably by each bridge's own low-active nFAULT pin (see
-//  hbridge_fault.h) — the DRV887x chips already detect that in
+//  hbridge_guard.h) — the DRV887x chips already detect that in
 //  hardware faster and more accurately than an ADC-threshold guess
 //  ever could. This class is therefore scoped to exactly what the
 //  SENSE line is uniquely useful for: detecting the brief current

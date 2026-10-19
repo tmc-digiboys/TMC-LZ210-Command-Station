@@ -4,7 +4,7 @@
 //
 //  See dcc_current_monitor.h for the full class-level explanation of
 //  why this is now instantiated three times (once per v2 H-bridge),
-//  why short-circuit detection moved to HBridgeFault (hbridge_fault.h),
+//  why short-circuit detection moved to HBridgeGuard (hbridge_guard.h),
 //  and why the threshold is configured in millivolts.
 // ═══════════════════════════════════════════════════════════════
 #include "dcc_current_monitor.h"

@@ -42,6 +42,8 @@ enum class XNHandleResult : uint8_t {
     BROADCAST_ONLY, // Broadcast only, no direct response to sender
     ERROR,          // Error response (resp/respLen contain error frame)
     OK_SILENT,      // Command accepted; no 0x01 0x04 on RS485, but on LAN/USB
+    REPLY_RAW,      // RS-485 only: send resp WITHOUT a call byte in front
+                    // (Roco/Z21 turnout echo, see handleTurnout())
 };
 
 // ─────────────────────────────────────────────────────────────
